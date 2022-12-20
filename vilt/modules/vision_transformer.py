@@ -37,7 +37,7 @@ from timm.models.helpers import load_pretrained
 from timm.models.layers import StdConv2dSame, DropPath, to_2tuple, trunc_normal_
 from timm.models.resnet import resnet26d, resnet50d
 from timm.models.resnetv2 import ResNetV2
-from timm.models.registry import register_model
+from timm.models import register_model
 from torchvision import transforms
 
 _logger = logging.getLogger(__name__)

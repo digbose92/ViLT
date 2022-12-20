@@ -256,7 +256,7 @@ class ViLTransformerSS(pl.LightningModule):
 #another ViLT transformer class with bottleneck tokens 
 
 
-class ViLTTransformerBN(nn.Module):
+class ViLTTransformerBN(pl.LightningModule):
     def __init__(self, config):
         super().__init__()
         self.save_hyperparameters() #specific to pytorch lightning 
