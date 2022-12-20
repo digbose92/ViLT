@@ -251,3 +251,166 @@ class ViLTransformerSS(pl.LightningModule):
 
     def configure_optimizers(self):
         return vilt_utils.set_schedule(self)
+
+
+#another ViLT transformer class with bottleneck tokens 
+
+
+class ViLTTransformerBN(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.save_hyperparameters() #specific to pytorch lightning 
+
+        #bert config for the text part 
+        bert_config = BertConfig(
+            vocab_size=config["vocab_size"],
+            hidden_size=config["hidden_size"],
+            num_hidden_layers=config["num_layers"],
+            num_attention_heads=config["num_heads"],
+            intermediate_size=config["hidden_size"] * config["mlp_ratio"],
+            max_position_embeddings=config["max_text_len"],
+            hidden_dropout_prob=config["drop_rate"],
+            attention_probs_dropout_prob=config["drop_rate"],
+        )
+
+        self.text_embeddings = BertEmbeddings(bert_config)
+        self.text_embeddings.apply(objectives.init_weights)
+
+        self.token_type_embeddings = nn.Embedding(2, config["hidden_size"])
+        self.token_type_embeddings.apply(objectives.init_weights)
+
+        #new addition 
+        self.bottleneck_embeddings=nn.Embedding(config['num_bottleneck_tokens'],config['hidden_size']) #not initiliazlied from original weights 
+        
+
+        #number of classes
+        self.num_classes = config["num_classes"]
+
+        if self.hparams.config["load_path"] == "":
+            self.transformer = getattr(vit, self.hparams.config["vit"])(
+                pretrained=True, config=self.hparams.config
+            )
+        else:
+            self.transformer = getattr(vit, self.hparams.config["vit"])(
+                pretrained=False, config=self.hparams.config
+            )
+
+        #pooler configuration 
+        self.pooler = heads.Pooler(config["hidden_size"])
+        self.pooler.apply(objectives.init_weights)
+
+        #classifier after pooler instantiation 
+        hs=self.hparams.config["hidden_size"]
+        self.classifier = nn.Sequential(
+                nn.Linear(hs, hs * 2),
+                nn.LayerNorm(hs * 2),
+                nn.GELU(),
+                nn.Linear(hs * 2, self.num_classes)
+            )
+        self.classifier.apply(objectives.init_weights)
+
+        #not adding initializer here since iniitialization will be done using dictionary key wise 
+
+    def infer(
+        self,
+        batch,
+        mask_text=False,
+        mask_image=False,
+        image_token_type_idx=1,
+        image_embeds=None,
+        image_masks=None,
+    ):
+
+        if f"image_{image_token_type_idx - 1}" in batch:
+            imgkey = f"image_{image_token_type_idx - 1}"
+        else:
+            imgkey = "image"
+
+        #text embedding portion 
+        text_ids = batch[f"text_ids"]
+        text_labels = batch[f"text_labels"]
+        text_masks = batch[f"text_masks"]
+        text_embeds = self.text_embeddings(text_ids)
+
+        if image_embeds is None and image_masks is None:
+            img = batch[imgkey][0]
+            (
+                image_embeds,
+                image_masks,
+                patch_index,
+                image_labels,
+            ) = self.transformer.visual_embed(
+                img,
+                max_image_len=self.hparams.config["max_image_len"],
+                mask_it=mask_image,
+            )
+        else:
+            patch_index, image_labels = (
+                None,
+                None,
+            )
+
+        text_embeds, image_embeds = (
+            text_embeds + self.token_type_embeddings(torch.zeros_like(text_masks)),
+            image_embeds
+            + self.token_type_embeddings(
+                torch.full_like(image_masks, image_token_type_idx)
+            ),
+        )
+
+        #bottleneck embeds 
+        bottleneck_masks=torch.ones(image_embeds.shape[0],self.hparams.config['num_bottleneck_tokens'])
+        bottleneck_embeds=self.bottleneck_embeddings(torch.arange(self.hparams.config['num_bottleneck_tokens']).unsqueeze(0).repeat(image_embeds.shape[0],1)) #expand to (batch_size,num_bottleneck_tokens,hidden_size)
+
+        #second operation : attention between image and bottleneck tokens
+        co_image_bn_embeds = torch.cat([bottleneck_embeds, image_embeds], dim=1)
+        co_image_bn_masks = torch.cat([text_masks, image_masks], dim=1)
+
+        for i, blk in enumerate(self.transformer.blocks):
+            co_image_bn_embeds, _attn = blk(co_image_bn_embeds, mask=co_image_bn_masks)
+
+        #third operation : attention between text and bottleneck tokens
+        co_text_bn_embeds = torch.cat([text_embeds, bottleneck_embeds], dim=1)
+        co_text_bn_masks = torch.cat([text_masks, bottleneck_masks], dim=1)
+
+        for i, blk in enumerate(self.transformer.blocks):
+            co_text_bn_embeds, _attn = blk(co_text_bn_embeds, mask=co_text_bn_masks)
+
+        ### not using any token type embeddings for the bottleneck tokens 
+
+        co_text_bn_embeds = self.transformer.norm(co_text_bn_embeds) #layernorm of transformer on the text and bn embeddings 
+        text_feats, bn_feats = (
+            co_text_bn_embeds[:, : text_embeds.shape[1]],
+            co_text_bn_embeds[:, text_embeds.shape[1] :],
+        )
+
+        #cls_feats = self.pooler(co_text_bn_embeds)
+
+        #pooler takes the first token of co_text_bn_embeds and passes it through set of linear layers
+        #take average of the bn_feats 
+        bn_feats=bn_feats.mean(dim=1)
+
+        #pass it to classifier 
+        cls_logits=self.classifier(bn_feats)
+
+        return(cls_logits)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
