@@ -4,7 +4,7 @@ from .utils import (
 )
 from torchvision import transforms
 from .randaug import RandAugment
-
+import requests 
 
 def pixelbert_transform(size=800):
     longer = int((1333 / 800) * size)
@@ -15,7 +15,6 @@ def pixelbert_transform(size=800):
             inception_normalize,
         ]
     )
-
 
 def pixelbert_transform_randaug(size=800):
     longer = int((1333 / 800) * size)
@@ -28,3 +27,6 @@ def pixelbert_transform_randaug(size=800):
     )
     trs.transforms.insert(0, RandAugment(2, 9))
     return trs
+
+
+

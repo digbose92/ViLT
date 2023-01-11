@@ -76,7 +76,6 @@ def main(_config):
         answer = id2ans[str(vqa_logits.argmax().item())]
 
         return [np.array(image), answer]
-
     inputs = [
         gr.inputs.Textbox(
             label="Url of an image.",

@@ -20,7 +20,6 @@ def get_pretrained_tokenizer(from_pretrained):
         from_pretrained, do_lower_case="uncased" in from_pretrained
     )
 
-
 class BaseDataModule(LightningDataModule):
     def __init__(self, _config):
         super().__init__()
