@@ -437,6 +437,8 @@ class ViLTTransformerBNv2(pl.LightningModule):
 
         self.text_embeddings = BertEmbeddings(bert_config)
         self.text_embeddings.apply(objectives.init_weights)
+        self.mod_drop_flag=config['mod_drop_flag']
+        self.mod_choice=config['mod_choice']
 
         self.token_type_embeddings = nn.Embedding(2, config["hidden_size"])
         self.token_type_embeddings.apply(objectives.init_weights)
@@ -467,7 +469,6 @@ class ViLTTransformerBNv2(pl.LightningModule):
     def infer(
         self,
         batch,
-        mask_text=False,
         mask_image=False,
         image_token_type_idx=1,
         image_embeds=None,
@@ -478,6 +479,8 @@ class ViLTTransformerBNv2(pl.LightningModule):
         text_ids = batch["text_ids"]
         #text_labels = batch[f"text_labels"]
         text_masks = batch[f"text_masks"]
+        mod_drop_flag=batch[f"mod_drop_flag"] #modality dropout flag
+
         text_embeds = self.text_embeddings(text_ids)
 
         if image_embeds is None and image_masks is None:
@@ -509,51 +512,192 @@ class ViLTTransformerBNv2(pl.LightningModule):
         #combined embeddings
         combined_embeds=torch.cat([text_embeds,image_embeds,bottleneck_embeds],dim=1)
 
-        ####################################################### FIRST FORWARD PASS SECTION #########################################################
-        #first operation (forward pass) consists of attention between image and bottleneck tokens 
-        #so text masks would be completely zeros, bottleneck masks would be all ones and image masks would be combination of 1s and zeros 
-        text_mask_fwd_pass_1=torch.zeros(image_embeds.shape[0],self.hparams.config['max_len']).to(self.config['device'])
-        fwd_pass_1_mask=torch.cat([text_mask_fwd_pass_1,image_masks,bottleneck_masks],dim=1)
-        for i, blk in enumerate(self.transformer.blocks):
-            co_image_bn_embeds, _attn = blk(combined_embeds, mask=fwd_pass_1_mask)
-        
-        co_image_bn_embeds = self.transformer.norm(co_image_bn_embeds) #layernorm of transformer on the image and bn embeddings
-        image_feats, bn_image_feats = (
-            co_image_bn_embeds[:, text_embeds.shape[1]:text_embeds.shape[1]+image_embeds.shape[1]],
-            co_image_bn_embeds[:, text_embeds.shape[1]+image_embeds.shape[1]:],
-        )
-        #print(image_feats.shape,bn_image_feats.shape)
+
+        if(self.mod_drop_choice==False): #no modality dropout .... no need to use modality dropout mask
+
+            ####################################################### FIRST FORWARD PASS SECTION #########################################################
+            #first operation (forward pass) consists of attention between image and bottleneck tokens 
+            #so text masks would be completely zeros, bottleneck masks would be all ones and image masks would be combination of 1s and zeros 
+            text_mask_fwd_pass_1=torch.zeros(image_embeds.shape[0],self.hparams.config['max_len']).to(self.config['device'])
+            fwd_pass_1_mask=torch.cat([text_mask_fwd_pass_1,image_masks,bottleneck_masks],dim=1)
+            for i, blk in enumerate(self.transformer.blocks):
+                co_image_bn_embeds, _attn = blk(combined_embeds, mask=fwd_pass_1_mask)
+            
+            co_image_bn_embeds = self.transformer.norm(co_image_bn_embeds) #layernorm of transformer on the image and bn embeddings
+            image_feats, bn_image_feats = (
+                co_image_bn_embeds[:, text_embeds.shape[1]:text_embeds.shape[1]+image_embeds.shape[1]],
+                co_image_bn_embeds[:, text_embeds.shape[1]+image_embeds.shape[1]:],
+            )
+            #print(image_feats.shape,bn_image_feats.shape)
 
 
-        ####################################################### SECOND FORWARD PASS SECTION #########################################################
-        #second operation (forward pass) consists of attention between text and bottleneck tokens 
-        #so text masks would be mixture of 0s and 1s, bottleneck masks would be all ones and image masks would be all zeros 
-        image_mask_max_len=image_masks.shape[1]
-        image_mask_fwd_pass_2=torch.zeros(image_embeds.shape[0],image_mask_max_len).to(self.config['device'])
-        fwd_pass_2_mask=torch.cat([text_masks,image_mask_fwd_pass_2,bottleneck_masks],dim=1)
+            ####################################################### SECOND FORWARD PASS SECTION #########################################################
+            #second operation (forward pass) consists of attention between text and bottleneck tokens 
+            #so text masks would be mixture of 0s and 1s, bottleneck masks would be all ones and image masks would be all zeros 
+            image_mask_max_len=image_masks.shape[1]
+            image_mask_fwd_pass_2=torch.zeros(image_embeds.shape[0],image_mask_max_len).to(self.config['device'])
+            fwd_pass_2_mask=torch.cat([text_masks,image_mask_fwd_pass_2,bottleneck_masks],dim=1)
 
-        for i, blk in enumerate(self.transformer.blocks):
-            co_text_bn_embeds, _attn = blk(combined_embeds, mask=fwd_pass_2_mask)
-        
-        co_text_bn_embeds = self.transformer.norm(co_text_bn_embeds) #layernorm of transformer on the image and bn embeddings
-        text_feats, bn_text_feats = (
-            co_text_bn_embeds[:, :text_embeds.shape[1]],
-            co_text_bn_embeds[:, text_embeds.shape[1]+image_embeds.shape[1]:],
-        )
+            for i, blk in enumerate(self.transformer.blocks):
+                co_text_bn_embeds, _attn = blk(combined_embeds, mask=fwd_pass_2_mask)
+            
+            co_text_bn_embeds = self.transformer.norm(co_text_bn_embeds) #layernorm of transformer on the image and bn embeddings
+            text_feats, bn_text_feats = (
+                co_text_bn_embeds[:, :text_embeds.shape[1]],
+                co_text_bn_embeds[:, text_embeds.shape[1]+image_embeds.shape[1]:],
+            )
 
-        #pooler takes the first token of co_text_bn_embeds and passes it through set of linear layers
-        #take average of the bn_feats 
-        bn_text_feats_avg=bn_text_feats.mean(dim=1)
-        bn_image_feats_avg=bn_image_feats.mean(dim=1)
+            bn_feats=(bn_image_feats+bn_text_feats)/2 #average of the bn feats from both the forward passes
 
-        #for now pooling is used but later concatenation of the two can be done on the feature dimensions
+        else: #modality dropout here 
+
+            #two possible pathways in the forward pass 
+            # (1) where modality dropout choice is image and complete modality is text: 
+                # run the first forward pass with filtered image samples and then run the second forward pass with complete text samples
+            # (2) where modality dropout choice is text and complete modality is image:
+                # run the first forward pass with complete image samples and then run the second forward pass with filtered text samples
+            
+            index_modality_dropped=torch.where(mod_drop_flag==True)[0] #index of the samples where modality is dropped
+            index_complete_modality=torch.where(mod_drop_flag==False)[0] #index of the samples where modality is not dropped
+
+            #filtered segment containing the missing modality samples 
+            mmod_image_embeds=image_embeds[index_modality_dropped,:] 
+            mmod_text_embeds=text_embeds[index_modality_dropped,:] 
+            mmod_bottleneck_embeds=bottleneck_embeds[index_modality_dropped,:]
+            mmod_image_masks=image_masks[index_modality_dropped,:]
+            mmod_text_masks=text_masks[index_modality_dropped,:]
+            mmod_bottleneck_masks=image_masks[index_modality_dropped,:]
+
+            #part of the filtered segment containing the complete modality samples
+            compl_image_embeds=image_embeds[index_complete_modality,:]
+            compl_text_embeds=text_embeds[index_complete_modality,:]
+            compl_bottleneck_embeds=bottleneck_embeds[index_complete_modality,:]
+            compl_image_masks=image_masks[index_complete_modality,:]
+            compl_text_masks=text_masks[index_complete_modality,:]
+            compl_bottleneck_masks=image_masks[index_complete_modality,:]
+
+            #create a dummy tensor for the bottleneck tokens embeddings
+            bn_feats=torch.zeros(mmod_image_embeds.shape[0],
+                        self.hparams.config['num_bottleneck_tokens'],
+                        self.hparams.config['hidden_size']).to(self.config['device'])
+
+            #idea is to inject the mmod_bottleneck_embeds (passed through vilt) into the indices i.e. index_modality_dropped  
+            #compl_bottleneck_embeds (passed through vilt) into the indices i.e. index_complete_modality
+
+
+            if(self.mod_choice=='image'): #modality dropout choice is image and complete modality is text
+                
+                ####################################### ATTENTION BETWEEN TEXT AND BOTTLENECK TOKENS FOR MISSING MODALITY SAMPLES ########################################
+                ## perform attention between text and bottleneck tokens for the missing modality samples
+                #mask for image tokens would be zeros and text would be normal masks and bottleneck tokens would be all ones
+                combined_img_mmod_embeds=torch.cat([mmod_text_embeds,mmod_image_embeds,mmod_bottleneck_embeds],dim=1)
+                image_mmod_mask_len=mmod_image_masks.shape[1]
+                image_mmod_mask_fwd_pass=torch.zeros(mmod_image_embeds.shape[0],image_mmod_mask_len).to(self.config['device'])
+                total_mmod_mask_fwd_pass=torch.cat([mmod_text_masks,image_mmod_mask_fwd_pass,mmod_bottleneck_masks],dim=1)
+
+                #forward pass for text and bottleneck for the missing modality samples
+                for i, blk in enumerate(self.transformer.blocks):
+                    co_img_mmod_bn_embeds, _attn = blk(combined_img_mmod_embeds, mask=total_mmod_mask_fwd_pass)
+                
+                co_img_mmod_bn_embeds = self.transformer.norm(co_img_mmod_bn_embeds)
+
+                #extract the bottleneck embeddings from co_img_mmod_bn_embeds
+                mmod_bn_feats = co_img_mmod_bn_embeds[:, mmod_text_embeds.shape[1]+mmod_image_embeds.shape[1]:]
+
+                #(this has a shape (B',N,H) where B' is the number of missing modality samples and N is the number of bottleneck tokens and H is the hidden size)
+
+
+            elif(self.mod_choice=='text'):
+
+                #print('TO BE IMPLEMENTED')'
+
+                ####################################### ATTENTION BETWEEN IMAGE AND BOTTLENECK TOKENS FOR MISSING MODALITY SAMPLES ########################################
+                ## perform attention between image and bottleneck tokens for the missing modality samples
+                #mask for text tokens would be zeros and image would be normal masks and bottleneck tokens would be all ones
+
+                combined_text_mmod_embeds=torch.cat([mmod_text_embeds,mmod_image_embeds,mmod_bottleneck_embeds],dim=1)
+                text_mmod_mask_fwd_pass=torch.zeros(mmod_text_embeds.shape[0],self.hparams.config['max_len']).to(self.config['device'])
+                total_mmod_mask_fwd_pass=torch.cat([text_mmod_mask_fwd_pass,mmod_image_masks,mmod_bottleneck_masks],dim=1)
+
+
+                #forward pass for image and bottleneck for the missing modality samples
+
+                for i, blk in enumerate(self.transformer.blocks):
+                    co_text_mmod_bn_embeds, _attn = blk(combined_text_mmod_embeds, mask=total_mmod_mask_fwd_pass)
+
+                co_text_mmod_bn_embeds = self.transformer.norm(co_text_mmod_bn_embeds)
+
+
+                #extract the bottleneck embeddings from co_text_mmod_bn_embeds
+
+                mmod_bn_feats = co_text_mmod_bn_embeds[:, mmod_text_embeds.shape[1]:mmod_text_embeds.shape[1]+mmod_image_embeds.shape[1]]
+
+                #(this has a shape (B',N,H) where B' is the number of missing modality samples and N is the number of bottleneck tokens and H is the hidden size)
+
+
+            ####################################### ATTENTION BETWEEN (1) IMAGE (2) TEXT AND BOTTLENECK TOKENS FOR COMPLETE MODALITY SAMPLES ########################################
+            ## perform two stage attention operation between 
+            # (1) image and bottleneck tokens (2) text and bottleneck tokens for complete modality samples
+            combined_embeds_compl=torch.cat([compl_text_embeds,compl_image_embeds,compl_bottleneck_embeds],dim=1)
+
+            ####################################################### FIRST FORWARD PASS SECTION #########################################################
+            #first operation (forward pass) consists of attention between image and bottleneck tokens 
+            #so text masks would be completely zeros, bottleneck masks would be all ones and image masks would be combination of 1s and zeros 
+            text_mask_fwd_pass_1_compl=torch.zeros(compl_image_embeds.shape[0],self.hparams.config['max_len']).to(self.config['device'])
+            fwd_pass_1_mask_compl=torch.cat([text_mask_fwd_pass_1_compl,compl_image_masks,compl_bottleneck_masks],dim=1)
+            
+            for i, blk in enumerate(self.transformer.blocks):
+                co_image_bn_embeds_compl, _attn = blk(combined_embeds_compl, mask=fwd_pass_1_mask_compl)
+            
+            co_image_bn_embeds_compl = self.transformer.norm(co_image_bn_embeds_compl) #layernorm of transformer on the image and bn embeddings
+            bn_image_feats_compl=co_image_bn_embeds_compl[:, compl_text_embeds.shape[1]+compl_image_embeds.shape[1]:] #first part of the bottleneck tokens 
+
+            #(this has a shape (B",N,H) where B" is the number of complete modality samples and N is the number of bottleneck tokens and H is the hidden size)
+
+
+            ####################################################### SECOND FORWARD PASS SECTION #########################################################
+            #second operation (forward pass) consists of attention between text and bottleneck tokens 
+            #so text masks would be mixture of 0s and 1s, bottleneck masks would be all ones and image masks would be all zeros 
+            image_mask_max_len=compl_image_masks.shape[1]
+            image_mask_fwd_pass_2=torch.zeros(compl_image_embeds.shape[0],image_mask_max_len).to(self.config['device'])
+            fwd_pass_2_mask_compl=torch.cat([compl_text_masks,image_mask_fwd_pass_2,compl_bottleneck_masks],dim=1)
+
+            for i, blk in enumerate(self.transformer.blocks):
+                co_text_bn_embeds, _attn = blk(combined_embeds_compl, mask=fwd_pass_2_mask_compl)
+            
+            co_text_bn_embeds_compl = self.transformer.norm(co_text_bn_embeds_compl) #layernorm of transformer on the image and bn embeddings
+            bn_text_feats_compl = co_text_bn_embeds_compl[:, compl_text_embeds.shape[1]+compl_image_embeds.shape[1]:]
+
+
+            #(this has a shape (B",N,H) where B" is the number of complete modality samples and N is the number of bottleneck tokens and H is the hidden size)
+
+            #average the text and image features for the complete modality samples
+            bn_feats_compl=(bn_text_feats_compl+bn_image_feats_compl)/2
+
+
+            #insert the missing modality bottleneck features and complete modality features into respective locations inside the feature matrix
+            #this is done to maintain the order of the samples in the feature matrix
+
+            #first insert the missing modality features
+            bn_feats[index_modality_dropped,:]=mmod_bn_feats
+            bn_feats[index_complete_modality,:]=bn_feats_compl
+
+
+
+        # #pooler takes the first token of co_text_bn_embeds and passes it through set of linear layers
+        # #take average of the bn_feats 
+        # bn_text_feats_avg=bn_text_feats.mean(dim=1)
+        # bn_image_feats_avg=bn_image_feats.mean(dim=1)
+
+        # #for now pooling is used but later concatenation of the two can be done on the feature dimensions
+        bn_avg_feats=bn_feats.mean(dim=1)
 
         #average the text and image features #can be concatenated layer as well
         #bn_feats=(bn_text_feats_avg+bn_image_feats_avg)/2
-        bn_feats=torch.cat([bn_text_feats_avg,bn_image_feats_avg],dim=1)
+        #bn_feats=torch.cat([bn_text_feats_avg,bn_image_feats_avg],dim=1)
 
         #pass it to classifier 
-        cls_logits=self.classifier(bn_feats)
+        cls_logits=self.classifier(bn_avg_feats)
 
         return(cls_logits)
 
