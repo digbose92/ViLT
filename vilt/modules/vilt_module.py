@@ -448,7 +448,7 @@ class ViLTTransformerBNv2(pl.LightningModule):
         
         #number of classes
         self.num_classes = config["num_classes"]
-
+        self.patch_size = self.hparams.config["patch_size"]
         # if self.hparams.config["load_path"] == "":
         #print(self.hparams.config["vit"])
         self.transformer = getattr(vit, self.hparams.config["vit"])(
@@ -483,38 +483,34 @@ class ViLTTransformerBNv2(pl.LightningModule):
 
         text_embeds = self.text_embeddings(text_ids)
 
-        if image_embeds is None and image_masks is None:
-            img = batch["image"]
-            (
-                image_embeds,
-                image_masks,
-                patch_index,
-                image_labels,
-            ) = self.transformer.visual_embed(
-                img,
-                max_image_len=self.hparams.config["max_image_len"],
-                mask_it=mask_image,
-            )
-       
-
-        text_embeds, image_embeds = (
-            text_embeds + self.token_type_embeddings(torch.zeros_like(text_masks)),
-            image_embeds
-            + self.token_type_embeddings(
-                torch.full_like(image_masks, image_token_type_idx)
-            ),
-        )
-
+        #if image_embeds is None and image_masks is None:
+        img = batch["image"]
+        #print(img)
+        
         #bottleneck embeds 
-        bottleneck_masks=torch.ones(image_embeds.shape[0],self.hparams.config['num_bottleneck_tokens']).to(self.config['device']) #always ones
-        bottleneck_embeds=self.bottleneck_embeddings(torch.arange(self.hparams.config['num_bottleneck_tokens']).to(self.config['device']).unsqueeze(0).repeat(image_embeds.shape[0],1)) #expand to (batch_size,num_bottleneck_tokens,hidden_size)
-
-        #combined embeddings
-        combined_embeds=torch.cat([text_embeds,image_embeds,bottleneck_embeds],dim=1)
-
-
+        bottleneck_masks=torch.ones(text_embeds.shape[0],self.hparams.config['num_bottleneck_tokens']).to(self.config['device']) #always ones
+        bottleneck_embeds=self.bottleneck_embeddings(torch.arange(self.hparams.config['num_bottleneck_tokens']).to(self.config['device']).unsqueeze(0).repeat(text_embeds.shape[0],1)) #expand to (batch_size,num_bottleneck_tokens,hidden_size)
         if(self.mod_dropout_flag==False): #no modality dropout .... no need to use modality dropout mask
-
+            
+            #print(img)
+            (
+                    image_embeds,
+                    image_masks,
+                    patch_index,
+                    image_labels,
+            ) = self.transformer.visual_embed(
+                    img,
+                    max_image_len=self.hparams.config["max_image_len"],
+                    mask_it=mask_image,
+                )
+        
+            text_embeds, image_embeds = (
+                    text_embeds + self.token_type_embeddings(torch.zeros_like(text_masks)),
+                    image_embeds + self.token_type_embeddings(torch.full_like(image_masks, image_token_type_idx))
+            )
+            #combined embeddings
+            combined_embeds=torch.cat([text_embeds,image_embeds,bottleneck_embeds],dim=1)
+            #bottleneck embeds 
             ####################################################### FIRST FORWARD PASS SECTION #########################################################
             #first operation (forward pass) consists of attention between image and bottleneck tokens 
             #so text masks would be completely zeros, bottleneck masks would be all ones and image masks would be combination of 1s and zeros 
@@ -560,42 +556,64 @@ class ViLTTransformerBNv2(pl.LightningModule):
             index_modality_dropped=torch.where(mod_drop_flag==True)[0] #index of the samples where modality is dropped
             index_complete_modality=torch.where(mod_drop_flag==False)[0] #index of the samples where modality is not dropped
 
-
-            #print(index_complete_modality.shape,index_modality_dropped.shape)
-
             #filtered segment containing the missing modality samples 
-            mmod_image_embeds=image_embeds[index_modality_dropped,:] 
+            mmod_images=img[index_modality_dropped,:]  #image samples where modality is dropped
             mmod_text_embeds=text_embeds[index_modality_dropped,:] 
             mmod_bottleneck_embeds=bottleneck_embeds[index_modality_dropped,:]
-            mmod_image_masks=image_masks[index_modality_dropped,:]
             mmod_text_masks=text_masks[index_modality_dropped,:]
             mmod_bottleneck_masks=bottleneck_masks[index_modality_dropped,:]
 
             #part of the filtered segment containing the complete modality samples
-            compl_image_embeds=image_embeds[index_complete_modality,:]
+            compl_images=img[index_complete_modality,:] #image samples where modality is not dropped (complete modality)
             compl_text_embeds=text_embeds[index_complete_modality,:]
             compl_bottleneck_embeds=bottleneck_embeds[index_complete_modality,:]
-            compl_image_masks=image_masks[index_complete_modality,:]
             compl_text_masks=text_masks[index_complete_modality,:]
-            mmod_bottleneck_masks=bottleneck_masks[index_modality_dropped,:]
             compl_bottleneck_masks=bottleneck_masks[index_complete_modality,:]
 
             #create a dummy tensor for the bottleneck tokens embeddings
-            bn_feats=torch.randn(image_embeds.shape[0],
+            bn_feats=torch.randn(text_embeds.shape[0],
                         self.hparams.config['num_bottleneck_tokens'],
                         self.hparams.config['hidden_size']).to(self.config['device'])
 
             #idea is to inject the mmod_bottleneck_embeds (passed through vilt) into the indices i.e. index_modality_dropped  
             #compl_bottleneck_embeds (passed through vilt) into the indices i.e. index_complete_modality
-
+            #print("bn feats before:",bn_feats)
 
             if(self.mod_choice=='image'): #modality dropout choice is image and complete modality is text
                 
                 ####################################### ATTENTION BETWEEN TEXT AND BOTTLENECK TOKENS FOR MISSING MODALITY SAMPLES ########################################
                 ## perform attention between text and bottleneck tokens for the missing modality samples
                 #mask for image tokens would be zeros and text would be normal masks and bottleneck tokens would be all ones
+
+                ####################################### creating the dummy tensort for the image tokens ########################################
+                #maximum height of the images from the missing modality batches
+                max_height= max([img.shape[1] for img in mmod_images])
+                #maximum width of the images from the missing modality batches
+                max_width= max([img.shape[2] for img in mmod_images])
+
+                #num width patches
+                num_width_patches=(max_width//self.hparams.config['image_patch_size'])
+                #num height patches
+                num_height_patches=(max_height//self.hparams.config['image_patch_size'])
+
+                #make zero tensors of (batch size, num_height_patches x num_width_patches, hidden_size)
+                image_mmod_mask_len=num_height_patches*num_width_patches
+                mmod_image_embeds=torch.zeros(mmod_images.shape[0],image_mmod_mask_len,self.hparams.config['hidden_size']).to(self.config['device'])
+
+                ####################################### creating the dummy tensort for the image masks ########################################
+                #make zero tensors of (batch size, num_height_patches x num_width_patches)
+                image_mmod_mask_fwd_pass=torch.zeros(mmod_images.shape[0],image_mmod_mask_len).to(self.config['device'])
+
+                #include to0ken type embeddings for the image tokens
+                mmod_text_embeds, mmod_image_embeds = (
+                    mmod_text_embeds + self.token_type_embeddings(torch.zeros_like(mmod_text_masks)),
+                    image_embeds+ self.token_type_embeddings(torch.full_like(image_mmod_mask_fwd_pass, image_token_type_idx))
+                )
+
+                
                 combined_img_mmod_embeds=torch.cat([mmod_text_embeds,mmod_image_embeds,mmod_bottleneck_embeds],dim=1)
-                image_mmod_mask_len=mmod_image_masks.shape[1]
+
+
                 image_mmod_mask_fwd_pass=torch.zeros(mmod_image_embeds.shape[0],image_mmod_mask_len).to(self.config['device'])
                 total_mmod_mask_fwd_pass_image=torch.cat([mmod_text_masks,image_mmod_mask_fwd_pass,mmod_bottleneck_masks],dim=1)
 
@@ -604,25 +622,37 @@ class ViLTTransformerBNv2(pl.LightningModule):
                     co_img_mmod_bn_embeds, _attn = blk(combined_img_mmod_embeds, mask=total_mmod_mask_fwd_pass_image)
                 
                 co_img_mmod_bn_embeds = self.transformer.norm(co_img_mmod_bn_embeds)
-
-                
                 #extract the bottleneck embeddings from co_img_mmod_bn_embeds
                 mmod_bn_feats = co_img_mmod_bn_embeds[:, mmod_text_embeds.shape[1]+mmod_image_embeds.shape[1]:]
-
                 #(this has a shape (B',N,H) where B' is the number of missing modality samples and N is the number of bottleneck tokens and H is the hidden size)
 
 
             elif(self.mod_choice=='text'):
-
                 ####################################### ATTENTION BETWEEN IMAGE AND BOTTLENECK TOKENS FOR MISSING MODALITY SAMPLES ########################################
                 ## perform attention between image and bottleneck tokens for the missing modality samples
                 #mask for text tokens would be zeros and image would be normal masks and bottleneck tokens would be all ones
-                #print(index)
+
+                #pass the mmod images through visual embed encoder 
+                (
+                    mmod_image_embeds,
+                    mmod_image_masks,
+                    patch_index,
+                    image_labels,
+                ) = self.transformer.visual_embed(
+                    mmod_images,
+                    max_image_len=self.hparams.config["max_image_len"],
+                    mask_it=mask_image
+                )
+
+                #include to0ken type embeddings for the text and image tokens
+                mmod_text_embeds, mmod_image_embeds = (
+                    mmod_text_embeds + self.token_type_embeddings(torch.zeros_like(mmod_text_masks)),
+                    mmod_image_embeds + self.token_type_embeddings(torch.full_like(mmod_image_masks, image_token_type_idx))
+                )
+
                 combined_text_mmod_embeds=torch.cat([mmod_text_embeds,mmod_image_embeds,mmod_bottleneck_embeds],dim=1)
                 text_mmod_mask_fwd_pass=torch.zeros(mmod_text_embeds.shape[0],self.hparams.config['max_len']).to(self.config['device'])
                 total_mmod_mask_fwd_pass_text=torch.cat([text_mmod_mask_fwd_pass,mmod_image_masks,mmod_bottleneck_masks],dim=1)
-
-                #print(text_mmod_mask_fwd_pass.shape,mmod_image_masks.shape,mmod_bottleneck_masks.shape)
 
                 #forward pass for image and bottleneck for the missing modality samples
                 for i, blk in enumerate(self.transformer.blocks):
@@ -634,9 +664,26 @@ class ViLTTransformerBNv2(pl.LightningModule):
                 mmod_bn_feats = co_text_mmod_bn_embeds[:, mmod_text_embeds.shape[1]+mmod_image_embeds.shape[1]:]
                 #(this has a shape (B',N,H) where B' is the number of missing modality samples and N is the number of bottleneck tokens and H is the hidden size)
 
-                print(co_text_mmod_bn_embeds.shape,mmod_text_embeds.shape,mmod_image_embeds.shape,mmod_bottleneck_embeds.shape,mmod_bn_feats.shape)
-
             ####################################### ATTENTION BETWEEN (1) IMAGE (2) TEXT AND BOTTLENECK TOKENS FOR COMPLETE MODALITY SAMPLES ########################################
+            #pass the completed images through visual embed encoder
+            (
+                    compl_image_embeds,
+                    compl_image_masks,
+                    patch_index,
+                    image_labels,
+            ) = self.transformer.visual_embed(
+                    compl_images,
+                    max_image_len=self.hparams.config["max_image_len"],
+                    mask_it=mask_image
+            )
+
+            #include token type embeddings for the text and image tokens
+            compl_text_embeds, compl_image_embeds = (
+
+                compl_text_embeds + self.token_type_embeddings(torch.zeros_like(compl_text_masks)),
+                compl_image_embeds + self.token_type_embeddings(torch.full_like(compl_image_masks, image_token_type_idx))
+            )
+
             ## perform two stage attention operation between 
             # (1) image and bottleneck tokens (2) text and bottleneck tokens for complete modality samples
             combined_embeds_compl=torch.cat([compl_text_embeds,compl_image_embeds,compl_bottleneck_embeds],dim=1)
@@ -679,7 +726,7 @@ class ViLTTransformerBNv2(pl.LightningModule):
             bn_feats[id_complete_modality,:]=bn_feats_compl
 
 
-
+            #print("bn_feats after:",bn_feats)
 
 
 
@@ -690,9 +737,7 @@ class ViLTTransformerBNv2(pl.LightningModule):
 
         # #for now pooling is used but later concatenation of the two can be done on the feature dimensions
         bn_avg_feats=bn_feats.mean(dim=1)
-        print(bn_avg_feats.shape)
-
-
+        
         #average the text and image features #can be concatenated layer as well
         #bn_feats=(bn_text_feats_avg+bn_image_feats_avg)/2
         #bn_feats=torch.cat([bn_text_feats_avg,bn_image_feats_avg],dim=1)

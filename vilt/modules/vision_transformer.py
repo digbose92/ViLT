@@ -389,6 +389,7 @@ class PatchEmbed(nn.Module):
         img_size = to_2tuple(img_size)
         patch_size = to_2tuple(patch_size)
         num_patches = (img_size[1] // patch_size[1]) * (img_size[0] // patch_size[0])
+        print(num_patches)
         self.img_size = img_size
         self.patch_size = patch_size
         self.num_patches = num_patches
@@ -557,13 +558,19 @@ class VisionTransformer(nn.Module):
     def visual_embed(self, _x, max_image_len=200, mask_it=False):
         _, _, ph, pw = self.patch_embed.proj.weight.shape
 
+
         x = self.patch_embed(_x)
+        #print(x.shape,_x.shape)
         x_mask = (_x.sum(dim=1) != 0).float()[:, None, :, :]
+        #print(x_mask.shape)
         x_mask = F.interpolate(x_mask, size=(x.shape[2], x.shape[3])).long()
+        
         x_h = x_mask[:, 0].sum(dim=1)[:, 0]
         x_w = x_mask[:, 0].sum(dim=2)[:, 0]
+        #print(x_h,x_w)
 
         B, C, H, W = x.shape
+        #print("x.shape", x.shape)
         spatial_pos = (
             self.pos_embed[:, 1:, :]
             .transpose(1, 2)
@@ -583,7 +590,8 @@ class VisionTransformer(nn.Module):
         )
 
         pos_embed = pos_embed.flatten(2).transpose(1, 2)
-        x = x.flatten(2).transpose(1, 2)
+        x = x.flatten(2).transpose(1, 2) #here it becomes (64,361,768)
+        
         patch_index = (
             torch.stack(
                 torch.meshgrid(
@@ -595,6 +603,7 @@ class VisionTransformer(nn.Module):
             .flatten(1, 3)
         ).to(_x.device)
         x_mask = x_mask.flatten(1)
+        #print(x_mask.shape)
 
         if mask_it:
             x, label = self.mask_tokens(_x, x)
@@ -615,16 +624,27 @@ class VisionTransformer(nn.Module):
             max_image_len = min(eff.max(), max_image_len)
 
         valid_idx = x_mask.nonzero(as_tuple=False)
+        #print(valid_idx)
         non_valid_idx = (1 - x_mask).nonzero(as_tuple=False)
         unique_rows = valid_idx[:, 0].unique()
+        #print(unique_rows)
         valid_row_idx = [valid_idx[valid_idx[:, 0] == u] for u in unique_rows]
+    
         non_valid_row_idx = [
             non_valid_idx[non_valid_idx[:, 0] == u] for u in unique_rows
         ]
-
-        valid_nums = [v.size(0) for v in valid_row_idx]
-        non_valid_nums = [v.size(0) for v in non_valid_row_idx]
+        #print(valid_row_idx[0])
+        valid_nums = [v.size(0) for v in valid_row_idx] #valid number of patches for every batch element
+        #print(valid_nums)
+        non_valid_nums = [v.size(0) for v in non_valid_row_idx] #non valid number of patches for every batch element (padded)
         pad_nums = [max_image_len - v for v in valid_nums]
+
+        # print('Max image len:', max_image_len)
+        # print('Valid nums:', valid_nums)
+        # print('Non valid nums:', non_valid_nums)
+        # print('Pad nums:', pad_nums)
+
+
 
         select = list()
         for i, (v, nv, p) in enumerate(zip(valid_nums, non_valid_nums, pad_nums)):
@@ -643,6 +663,7 @@ class VisionTransformer(nn.Module):
 
         select = torch.cat(select, dim=0)
         x = x[select[:, 0], select[:, 1]].view(B, -1, C)
+        #print(x.shape)
         x_mask = x_mask[select[:, 0], select[:, 1]].view(B, -1)
         patch_index = patch_index[select[:, 0], select[:, 1]].view(B, -1, 2)
         pos_embed = pos_embed[select[:, 0], select[:, 1]].view(B, -1, C)
@@ -665,8 +686,9 @@ class VisionTransformer(nn.Module):
 
         if self.add_norm_before_transformer:
             x = self.pre_norm(x)
-
-        x_mask = torch.cat([torch.ones(x_mask.shape[0], 1).to(x_mask), x_mask], dim=1)
+        #print(x_mask)
+        x_mask = torch.cat([torch.ones(x_mask.shape[0], 1).to(x_mask), x_mask], dim=1) #the first ones is for cls token
+        #print(x.shape,x_mask.shape)
 
         if mask_it:
             return x, x_mask, (patch_index, (H, W)), label
