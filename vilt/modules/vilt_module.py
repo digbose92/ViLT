@@ -592,9 +592,9 @@ class ViLTTransformerBNv2(pl.LightningModule):
                 max_width= max([img.shape[2] for img in mmod_images])
 
                 #num width patches
-                num_width_patches=(max_width//self.hparams.config['image_patch_size'])
+                num_width_patches=(max_width//self.hparams.config['patch_size'])
                 #num height patches
-                num_height_patches=(max_height//self.hparams.config['image_patch_size'])
+                num_height_patches=(max_height//self.hparams.config['patch_size'])
 
                 #make zero tensors of (batch size, num_height_patches x num_width_patches, hidden_size)
                 image_mmod_mask_len=num_height_patches*num_width_patches
@@ -602,12 +602,13 @@ class ViLTTransformerBNv2(pl.LightningModule):
 
                 ####################################### creating the dummy tensort for the image masks ########################################
                 #make zero tensors of (batch size, num_height_patches x num_width_patches)
-                image_mmod_mask_fwd_pass=torch.zeros(mmod_images.shape[0],image_mmod_mask_len).to(self.config['device'])
+                image_mmod_mask_fwd_pass=torch.zeros(mmod_images.shape[0],image_mmod_mask_len,dtype=torch.long).to(self.config['device'])
+                #print(image_mmod_mask_fwd_pass)
 
                 #include to0ken type embeddings for the image tokens
                 mmod_text_embeds, mmod_image_embeds = (
                     mmod_text_embeds + self.token_type_embeddings(torch.zeros_like(mmod_text_masks)),
-                    image_embeds+ self.token_type_embeddings(torch.full_like(image_mmod_mask_fwd_pass, image_token_type_idx))
+                    mmod_image_embeds+ self.token_type_embeddings(torch.full_like(image_mmod_mask_fwd_pass, image_token_type_idx))
                 )
 
                 
