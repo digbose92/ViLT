@@ -942,8 +942,8 @@ class ViLTTransformerBN_token_average(pl.LightningModule): #uilize the token inf
             ## perform two stage attention operation between 
             # (1) image and bottleneck tokens (2) text and bottleneck tokens for complete modality samples
             combined_embeds_compl=torch.cat([compl_text_embeds,compl_image_embeds,compl_bottleneck_embeds],dim=1)
-            combined_embeds_compl_pass_2=combined_embeds_compl.clone()
-
+            combined_embeds_compl_pass_2=torch.cat([compl_text_embeds,compl_image_embeds,compl_bottleneck_embeds],dim=1)
+            
             ####################################################### FIRST FORWARD PASS SECTION #########################################################
             #first operation (forward pass) consists of attention between image and bottleneck tokens 
             #so text masks would be completely zeros, bottleneck masks would be all ones and image masks would be combination of 1s and zeros 
@@ -953,7 +953,7 @@ class ViLTTransformerBN_token_average(pl.LightningModule): #uilize the token inf
                 combined_embeds_compl, _attn = blk(combined_embeds_compl, mask=fwd_pass_1_mask_compl)
             
             combined_embeds_compl = self.transformer.norm(combined_embeds_compl) #layernorm of transformer on the image and bn embeddings
-            bn_image_feats_compl=combined_embeds_compl[:, combined_embeds_compl.shape[1]:combined_embeds_compl.shape[1]+combined_embeds_compl.shape[1]] #first part of the bottleneck tokens 
+            bn_image_feats_compl=combined_embeds_compl[:, compl_text_embeds.shape[1]:compl_text_embeds.shape[1]+compl_image_embeds.shape[1]] #first part of the bottleneck tokens 
 
 
             ####################################################### SECOND FORWARD PASS SECTION #########################################################
@@ -966,7 +966,7 @@ class ViLTTransformerBN_token_average(pl.LightningModule): #uilize the token inf
                 combined_embeds_compl_pass_2, _attn = blk(combined_embeds_compl_pass_2, mask=fwd_pass_2_mask_compl)
             
             combined_embeds_compl_pass_2 = self.transformer.norm(combined_embeds_compl_pass_2) #layernorm of transformer on the image and bn embeddings
-            bn_text_feats_compl = combined_embeds_compl_pass_2[:, 0:combined_embeds_compl_pass_2.shape[1]]
+            bn_text_feats_compl = combined_embeds_compl_pass_2[:, 0:compl_text_embeds.shape[1]]
 
             #idea is to inject the mmod_bottleneck_embeds (passed through vilt) into the indices i.e. index_modality_dropped  
             #compl_bottleneck_embeds (passed through vilt) into the indices i.e. index_complete_modality
