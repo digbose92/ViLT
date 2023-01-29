@@ -576,7 +576,7 @@ class VisionTransformer(nn.Module):
             .transpose(1, 2)
             .view(1, C, self.patch_dim, self.patch_dim)
         )
-        print(x_h.shape,x_w.shape)
+        #print(x_h.shape,x_w.shape)
         pos_embed = torch.cat(
             [
                 F.pad(
