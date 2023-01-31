@@ -1175,6 +1175,84 @@ class ViLTTransformer_token_aggregate(pl.LightningModule): #uilize the token inf
 
         #not adding initializer here since iniitialization will be done using dictionary key wise 
 
+    def handle_missing_image_modality(self, mmod_images, 
+                        mmod_text_embeds, 
+                        mmod_text_masks, 
+                        image_token_type_idx):
+
+            max_height= max([img.shape[1] for img in mmod_images])
+            #maximum width of the images from the missing modality batches
+            max_width= max([img.shape[2] for img in mmod_images])
+
+            #num width patches
+            num_width_patches=(max_width//self.hparams.config['patch_size'])
+            #num height patches
+            num_height_patches=(max_height//self.hparams.config['patch_size'])
+
+            #make zero tensors of (batch size, num_height_patches x num_width_patches, hidden_size)
+            image_mmod_mask_len=num_height_patches*num_width_patches
+            mmod_image_embeds=torch.zeros(mmod_images.shape[0],image_mmod_mask_len,self.hparams.config['hidden_size']).to(self.config['device'])
+
+            ####################################### creating the dummy tensort for the image masks ########################################
+            #make zero tensors of (batch size, num_height_patches x num_width_patches)
+            #include to0ken type embeddings for the image tokens
+            image_mmod_mask_fwd_pass=torch.zeros(mmod_image_embeds.shape[0],image_mmod_mask_len,dtype=torch.long).to(self.config['device'])
+            mmod_text_embeds, mmod_image_embeds = (
+                        mmod_text_embeds + self.token_type_embeddings(torch.zeros_like(mmod_text_masks)),
+                        mmod_image_embeds+ self.token_type_embeddings(torch.full_like(image_mmod_mask_fwd_pass, image_token_type_idx))
+                    )
+ 
+            combined_img_mmod_embeds=torch.cat([mmod_text_embeds,mmod_image_embeds],dim=1)
+                    
+            total_mmod_mask_fwd_pass_image=torch.cat([mmod_text_masks,image_mmod_mask_fwd_pass],dim=1)
+
+            #forward pass for text and bottleneck for the missing modality samples
+            for i, blk in enumerate(self.transformer.blocks):
+                combined_img_mmod_embeds, _attn = blk(combined_img_mmod_embeds, mask=total_mmod_mask_fwd_pass_image)
+                    
+            combined_img_mmod_embeds = self.transformer.norm(combined_img_mmod_embeds)
+
+            mmod_image_embeds=combined_img_mmod_embeds[:,mmod_text_embeds.shape[1]:,:]
+
+            return (mmod_image_embeds,combined_img_mmod_embeds)
+
+
+    def handle_missing_text_modality(self,mmod_images,
+                                mask_image,
+                                mmod_text_embeds,
+                                mmod_text_masks,image_token_type_idx):
+
+
+            (mmod_image_embeds,
+                        mmod_image_masks,
+                        patch_index,
+                        image_labels,
+            ) = self.transformer.visual_embed(
+                        mmod_images,
+                        max_image_len=self.hparams.config["max_image_len"],
+                        mask_it=mask_image
+            )
+
+            #include to0ken type embeddings for the text and image tokens
+            mmod_text_embeds, mmod_image_embeds = (
+                    mmod_text_embeds + self.token_type_embeddings(torch.zeros_like(mmod_text_masks)),
+                    mmod_image_embeds + self.token_type_embeddings(torch.full_like(mmod_image_masks, image_token_type_idx))
+            )
+
+            combined_text_mmod_embeds=torch.cat([mmod_text_embeds,mmod_image_embeds],dim=1)
+            text_mmod_mask_fwd_pass=torch.zeros(mmod_text_embeds.shape[0],self.hparams.config['max_len']).to(self.config['device'])
+            total_mmod_mask_fwd_pass_text=torch.cat([text_mmod_mask_fwd_pass,mmod_image_masks],dim=1)
+
+            #forward pass for image and bottleneck for the missing modality samples
+            for i, blk in enumerate(self.transformer.blocks):
+                combined_text_mmod_embeds, _attn = blk(combined_text_mmod_embeds, mask=total_mmod_mask_fwd_pass_text)
+
+            combined_text_mmod_embeds = self.transformer.norm(combined_text_mmod_embeds)
+            mmod_image_embeds=combined_text_mmod_embeds[:,mmod_text_embeds.shape[1]:,:]
+
+            return (mmod_image_embeds,combined_text_mmod_embeds)
+
+
     def infer(
         self,
         batch,
@@ -1252,170 +1330,143 @@ class ViLTTransformer_token_aggregate(pl.LightningModule): #uilize the token inf
             compl_text_embeds=text_embeds[id_modality_complete,:]
             compl_text_masks=text_masks[id_modality_complete,:]
 
-            ####################################### ATTENTION BETWEEN (1) IMAGE (2) TEXT AND BOTTLENECK TOKENS FOR COMPLETE MODALITY SAMPLES ########################################
-            #pass the completed images through visual embed encoder
-            (
-                compl_image_embeds,
-                compl_image_masks,
-                    patch_index,
-                    image_labels,
-            ) = self.transformer.visual_embed(
-                    compl_images,
-                    max_image_len=self.hparams.config["max_image_len"],
-                    mask_it=mask_image
-            )
 
-            #include token type embeddings for the text and image tokens
-            compl_text_embeds, compl_image_embeds = (
-
-                compl_text_embeds + self.token_type_embeddings(torch.zeros_like(compl_text_masks)),
-                compl_image_embeds + self.token_type_embeddings(torch.full_like(compl_image_masks, image_token_type_idx))
-            )
-
-            ## perform two stage attention operation between 
-            # (1) image and bottleneck tokens (2) text and bottleneck tokens for complete modality samples
-            combined_embeds_compl=torch.cat([compl_text_embeds,compl_image_embeds],dim=1)
-
-            ####################################################### FIRST FORWARD PASS SECTION #########################################################
-            #first operation (forward pass) consists of attention between image and bottleneck tokens 
-            #so text masks would be completely zeros, bottleneck masks would be all ones and image masks would be combination of 1s and zeros 
-            fwd_pass_mask_compl=torch.cat([compl_text_masks,compl_image_masks],dim=1)
-            for i, blk in enumerate(self.transformer.blocks):
-                combined_embeds_compl, _attn = blk(combined_embeds_compl, mask=fwd_pass_mask_compl)
-            
-            combined_embeds_compl = self.transformer.norm(combined_embeds_compl) #layernorm of transformer on the image and bn embeddings
-
-            compl_text_embeds, compl_image_embeds = ( 
-                combined_embeds_compl[:, 0:compl_text_embeds.shape[1]],
-                combined_embeds_compl[:, compl_text_embeds.shape[1]+compl_image_embeds.shape[1]:],
-            )
-
-
-            
-            if(self.mod_choice=='image'): #modality dropout choice is image and complete modality is text
-                #print('Here')
-                ####################################### ATTENTION BETWEEN TEXT AND BOTTLENECK TOKENS FOR MISSING MODALITY SAMPLES ########################################
-                ## perform attention between text and bottleneck tokens for the missing modality samples
-                #mask for image tokens would be zeros and text would be normal masks and bottleneck tokens would be all ones
-                ####################################### creating the dummy tensort for the image tokens ########################################
-                #maximum height of the images from the missing modality batches
-                max_height= max([img.shape[1] for img in mmod_images])
-                #maximum width of the images from the missing modality batches
-                max_width= max([img.shape[2] for img in mmod_images])
-
-                #num width patches
-                num_width_patches=(max_width//self.hparams.config['patch_size'])
-                #num height patches
-                num_height_patches=(max_height//self.hparams.config['patch_size'])
-
-                #make zero tensors of (batch size, num_height_patches x num_width_patches, hidden_size)
-                image_mmod_mask_len=num_height_patches*num_width_patches
-                mmod_image_embeds=torch.zeros(mmod_images.shape[0],image_mmod_mask_len,self.hparams.config['hidden_size']).to(self.config['device'])
-
-                ####################################### creating the dummy tensort for the image masks ########################################
-                #make zero tensors of (batch size, num_height_patches x num_width_patches)
-                #include to0ken type embeddings for the image tokens
-                image_mmod_mask_fwd_pass=torch.zeros(mmod_image_embeds.shape[0],image_mmod_mask_len,dtype=torch.long).to(self.config['device'])
-                mmod_text_embeds, mmod_image_embeds = (
-                    mmod_text_embeds + self.token_type_embeddings(torch.zeros_like(mmod_text_masks)),
-                    mmod_image_embeds+ self.token_type_embeddings(torch.full_like(image_mmod_mask_fwd_pass, image_token_type_idx))
-                )
-
+            if(len(id_modality_complete)==0):
                 
-                combined_img_mmod_embeds=torch.cat([mmod_text_embeds,mmod_image_embeds],dim=1)
-                
-                total_mmod_mask_fwd_pass_image=torch.cat([mmod_text_masks,image_mmod_mask_fwd_pass],dim=1)
+                if(self.mod_choice=="image"):
+                    
+                    mmod_image_embeds,combined_img_mmod_embeds=self.handle_missing_image_modality(mmod_images, 
+                                                mmod_text_embeds, 
+                                                mmod_text_masks, 
+                                                image_token_type_idx)
+                    
+                    text_feats=combined_img_mmod_embeds[:,:mmod_text_embeds.shape[1],:]
+                    first_token=text_feats[:,0,:] #directly using the first joint token from text features for classification
 
-                #forward pass for text and bottleneck for the missing modality samples
-                for i, blk in enumerate(self.transformer.blocks):
-                    combined_img_mmod_embeds, _attn = blk(combined_img_mmod_embeds, mask=total_mmod_mask_fwd_pass_image)
-                
-                combined_img_mmod_embeds = self.transformer.norm(combined_img_mmod_embeds)
+                elif(self.mod_choice=="text"):
 
-                mmod_image_embeds=combined_img_mmod_embeds[:,mmod_text_embeds.shape[1]:,:]
-                #print(combined_img_mmod_embeds.shape,mmod_image_embeds.shape)
+                    mmod_image_embeds,combined_text_mmod_embeds=self.handle_missing_text_modality(mmod_images,
+                                                                    mask_image,
+                                                                    mmod_text_embeds,
+                                                                    mmod_text_masks,
+                                                                    image_token_type_idx)
 
-                #find minimum image sizes between the complete and missing modality samples
-                image_embeds_shape=min(mmod_image_embeds.shape[1],compl_image_embeds.shape[1])
-                if(image_embeds_shape==compl_image_embeds.shape[1]):
-                    #truncate the mmod_image_embeds
-                   mmod_image_embeds=mmod_image_embeds[:,:image_embeds_shape,:]
-                else:
-                    #truncate the compl_image_embeds
-                    compl_image_embeds=compl_image_embeds[:,:image_embeds_shape,:]
+                    image_feats=combined_text_mmod_embeds[:,mmod_text_embeds.shape[1]:,:]
+                    first_token=image_feats[:,0,:] #directly using the first joint token from image features for classification
 
-                combined_img_mmod_embeds=torch.cat([combined_img_mmod_embeds[:,:mmod_text_embeds.shape[1],:],mmod_image_embeds],dim=1)
-                combined_embeds_compl=torch.cat([compl_text_embeds,compl_image_embeds],dim=1)
-
-                #print(combined_img_mmod_embeds.shape,combined_embeds_compl.shape)
-                #print(combined_embeds_compl.shape[1],combined_img_mmod_embeds.shape[1])
-                #aggregate with combined embeds empl for the complete modality samples in the specific indices
-                combined_embeds_repr=torch.zeros(text_embeds.shape[0],
-                                image_embeds_shape+text_embeds.shape[1],
-                                combined_embeds_compl.shape[2]).to(self.config['device'])
-
-                combined_embeds_repr[id_modality_complete,:]=combined_embeds_compl
-                combined_embeds_repr[id_modality_dropped,:]=combined_img_mmod_embeds
-                first_token=combined_embeds_repr[:,0,:]
-
-            elif(self.mod_choice=='text'):
-                ####################################### ATTENTION BETWEEN IMAGE AND BOTTLENECK TOKENS FOR MISSING MODALITY SAMPLES ########################################
-                ## perform attention between image and bottleneck tokens for the missing modality samples
-                #mask for text tokens would be zeros and image would be normal masks and bottleneck tokens would be all ones
-                #pass the mmod images through visual embed encoder 
+            else:
+                ####################################### ATTENTION BETWEEN (1) IMAGE (2) TEXT AND BOTTLENECK TOKENS FOR COMPLETE MODALITY SAMPLES ########################################
+                #pass the completed images through visual embed encoder
                 (
-                    mmod_image_embeds,
-                    mmod_image_masks,
-                    patch_index,
-                    image_labels,
+                    compl_image_embeds,
+                    compl_image_masks,
+                        patch_index,
+                        image_labels,
                 ) = self.transformer.visual_embed(
-                    mmod_images,
-                    max_image_len=self.hparams.config["max_image_len"],
-                    mask_it=mask_image
+                        compl_images,
+                        max_image_len=self.hparams.config["max_image_len"],
+                        mask_it=mask_image
                 )
 
-                #include to0ken type embeddings for the text and image tokens
-                mmod_text_embeds, mmod_image_embeds = (
-                    mmod_text_embeds + self.token_type_embeddings(torch.zeros_like(mmod_text_masks)),
-                    mmod_image_embeds + self.token_type_embeddings(torch.full_like(mmod_image_masks, image_token_type_idx))
+                #include token type embeddings for the text and image tokens
+                compl_text_embeds, compl_image_embeds = (
+
+                    compl_text_embeds + self.token_type_embeddings(torch.zeros_like(compl_text_masks)),
+                    compl_image_embeds + self.token_type_embeddings(torch.full_like(compl_image_masks, image_token_type_idx))
                 )
 
-                combined_text_mmod_embeds=torch.cat([mmod_text_embeds,mmod_image_embeds],dim=1)
-                text_mmod_mask_fwd_pass=torch.zeros(mmod_text_embeds.shape[0],self.hparams.config['max_len']).to(self.config['device'])
-                total_mmod_mask_fwd_pass_text=torch.cat([text_mmod_mask_fwd_pass,mmod_image_masks],dim=1)
-
-                #forward pass for image and bottleneck for the missing modality samples
-                for i, blk in enumerate(self.transformer.blocks):
-                    combined_text_mmod_embeds, _attn = blk(combined_text_mmod_embeds, mask=total_mmod_mask_fwd_pass_text)
-
-                combined_text_mmod_embeds = self.transformer.norm(combined_text_mmod_embeds)
-                mmod_image_embeds=combined_text_mmod_embeds[:,mmod_text_embeds.shape[1]:,:]
-
-
-                #combined_embeds_repr=torch.zeros(combined_embeds_compl.shape[0],combined_embeds_compl.shape[1]+combined_text_mmod_embeds.shape[1],combined_embeds_compl.shape[2]).to(self.config['device'])
-                image_embeds_shape=min(mmod_image_embeds.shape[1],compl_image_embeds.shape[1])
-                
-                if(image_embeds_shape==compl_image_embeds.shape[1]):
-                    #truncate the mmod_image_embeds
-                    mmod_image_embeds=mmod_image_embeds[:,:image_embeds_shape,:]
-                else:
-                    #truncate the compl_image_embeds
-                    compl_image_embeds=compl_image_embeds[:,:image_embeds_shape,:]
-
-                combined_text_mmod_embeds=torch.cat([combined_text_mmod_embeds[:,:mmod_text_embeds.shape[1],:],mmod_image_embeds],dim=1)
+                ## perform two stage attention operation between 
+                # (1) image and bottleneck tokens (2) text and bottleneck tokens for complete modality samples
                 combined_embeds_compl=torch.cat([compl_text_embeds,compl_image_embeds],dim=1)
 
-
-                combined_embeds_repr=torch.zeros(text_embeds.shape[0],
-                                image_embeds_shape+text_embeds.shape[1],
-                                combined_embeds_compl.shape[2]).to(self.config['device'])
-
-                #print(combined_embeds_repr.shape,combined_embeds_compl.shape,combined_text_mmod_embeds.shape)
-
-                combined_embeds_repr[id_modality_complete,:]=combined_embeds_compl
-                combined_embeds_repr[id_modality_dropped,:]=combined_text_mmod_embeds
-                first_token=combined_embeds_repr[:,0,:]
+                ####################################################### FIRST FORWARD PASS SECTION #########################################################
+                #first operation (forward pass) consists of attention between image and bottleneck tokens 
+                #so text masks would be completely zeros, bottleneck masks would be all ones and image masks would be combination of 1s and zeros 
+                fwd_pass_mask_compl=torch.cat([compl_text_masks,compl_image_masks],dim=1)
+                for i, blk in enumerate(self.transformer.blocks):
+                    combined_embeds_compl, _attn = blk(combined_embeds_compl, mask=fwd_pass_mask_compl)
                 
+                combined_embeds_compl = self.transformer.norm(combined_embeds_compl) #layernorm of transformer on the image and bn embeddings
+
+                compl_text_embeds, compl_image_embeds = ( 
+                    combined_embeds_compl[:, 0:compl_text_embeds.shape[1]],
+                    combined_embeds_compl[:, compl_text_embeds.shape[1]+compl_image_embeds.shape[1]:],
+                )
+
+
+                
+                if(self.mod_choice=='image'): #modality dropout choice is image and complete modality is text
+                    #print('Here')
+                    ####################################### ATTENTION BETWEEN TEXT AND BOTTLENECK TOKENS FOR MISSING MODALITY SAMPLES ########################################
+                    ## perform attention between text and bottleneck tokens for the missing modality samples
+                    #mask for image tokens would be zeros and text would be normal masks and bottleneck tokens would be all ones
+                    ####################################### creating the dummy tensort for the image tokens ########################################
+                    #maximum height of the images from the missing modality batches
+                    
+                    mmod_image_embeds,combined_img_mmod_embeds=self.handle_missing_image_modality(mmod_images, 
+                                                mmod_text_embeds, 
+                                                mmod_text_masks, 
+                                                image_token_type_idx)
+
+                    #find minimum image sizes between the complete and missing modality samples
+                    image_embeds_shape=min(mmod_image_embeds.shape[1],compl_image_embeds.shape[1])
+                    if(image_embeds_shape==compl_image_embeds.shape[1]):
+                        #truncate the mmod_image_embeds
+                        mmod_image_embeds=mmod_image_embeds[:,:image_embeds_shape,:]
+                    else:
+                        #truncate the compl_image_embeds
+                        compl_image_embeds=compl_image_embeds[:,:image_embeds_shape,:]
+
+                    combined_img_mmod_embeds=torch.cat([combined_img_mmod_embeds[:,:mmod_text_embeds.shape[1],:],mmod_image_embeds],dim=1)
+                    combined_embeds_compl=torch.cat([compl_text_embeds,compl_image_embeds],dim=1)
+
+                    #print(combined_img_mmod_embeds.shape,combined_embeds_compl.shape)
+                    #print(combined_embeds_compl.shape[1],combined_img_mmod_embeds.shape[1])
+                    #aggregate with combined embeds empl for the complete modality samples in the specific indices
+                    combined_embeds_repr=torch.zeros(text_embeds.shape[0],
+                                    image_embeds_shape+text_embeds.shape[1],
+                                    combined_embeds_compl.shape[2]).to(self.config['device'])
+
+                    combined_embeds_repr[id_modality_complete,:]=combined_embeds_compl
+                    combined_embeds_repr[id_modality_dropped,:]=combined_img_mmod_embeds
+                    first_token=combined_embeds_repr[:,0,:]
+
+                elif(self.mod_choice=='text'):
+                    ####################################### ATTENTION BETWEEN IMAGE AND BOTTLENECK TOKENS FOR MISSING MODALITY SAMPLES ########################################
+                    ## perform attention between image and bottleneck tokens for the missing modality samples
+                    #mask for text tokens would be zeros and image would be normal masks and bottleneck tokens would be all ones
+                    #pass the mmod images through visual embed encoder 
+                    
+                    mmod_image_embeds,combined_text_mmod_embeds=self.handle_missing_text_modality(mmod_images,
+                                                                    mask_image,mmod_text_embeds,
+                                                                    mmod_text_masks,
+                                                                    image_token_type_idx)
+
+
+                    #combined_embeds_repr=torch.zeros(combined_embeds_compl.shape[0],combined_embeds_compl.shape[1]+combined_text_mmod_embeds.shape[1],combined_embeds_compl.shape[2]).to(self.config['device'])
+                    image_embeds_shape=min(mmod_image_embeds.shape[1],compl_image_embeds.shape[1])
+                    
+                    if(image_embeds_shape==compl_image_embeds.shape[1]):
+                        #truncate the mmod_image_embeds
+                        mmod_image_embeds=mmod_image_embeds[:,:image_embeds_shape,:]
+                    else:
+                        #truncate the compl_image_embeds
+                        compl_image_embeds=compl_image_embeds[:,:image_embeds_shape,:]
+
+                    combined_text_mmod_embeds=torch.cat([combined_text_mmod_embeds[:,:mmod_text_embeds.shape[1],:],mmod_image_embeds],dim=1)
+                    combined_embeds_compl=torch.cat([compl_text_embeds,compl_image_embeds],dim=1)
+
+
+                    combined_embeds_repr=torch.zeros(text_embeds.shape[0],
+                                    image_embeds_shape+text_embeds.shape[1],
+                                    combined_embeds_compl.shape[2]).to(self.config['device'])
+
+                    #print(combined_embeds_repr.shape,combined_embeds_compl.shape,combined_text_mmod_embeds.shape)
+
+                    combined_embeds_repr[id_modality_complete,:]=combined_embeds_compl
+                    combined_embeds_repr[id_modality_dropped,:]=combined_text_mmod_embeds
+                    first_token=combined_embeds_repr[:,0,:]
+                    
             #(this has a shape (B",N,H) where B" is the number of complete modality samples and N is the number of bottleneck tokens and H is the hidden size)
 
         #pass it to classifier
