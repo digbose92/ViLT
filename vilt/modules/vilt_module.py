@@ -5,6 +5,8 @@ import vilt.modules.vision_transformer as vit
 
 from transformers.models.bert.modeling_bert import BertConfig, BertEmbeddings
 from vilt.modules import heads, objectives, vilt_utils
+from operator import mul
+import math
 
 ########################################## original vilt implementation with SSL objective##########################################
 class ViLTransformerSS(pl.LightningModule):
@@ -1939,31 +1941,33 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
         self.mod_dropout_flag=config['mod_dropout_flag']
         self.mod_choice=config['mod_choice']
         self.initialization=config['initialization']
-        hs=self.hparams.config["hidden_size"]
+        self.hs=self.hparams.config["hidden_size"]
         self.num_prompts=self.hparams.config["num_prompts"]
 
         #token type embeddings for the text part
-        self.token_type_embeddings = nn.Embedding(2, hs)
+        self.token_type_embeddings = nn.Embedding(2, self.hs)
         self.token_type_embeddings.apply(objectives.init_weights)
 
         ########################## keeping number of prompts same for now ############################  
         #prompt embeddings for the text part (with image missing)
-        self.text_prompt_embeddings = nn.Parameter(torch.zeros(1,self.num_prompts, hs))
-        self.text_prompt_dropout=nn.Dropout(config['drop_rate'])
+        self.text_prompt_embeddings = nn.Parameter(torch.zeros(1,self.num_prompts, self.hs),requires_grad=True)
+        self.text_prompt_dropout=nn.Dropout(config['prompt_drop_rate'])
 
         #prompt embeddings for the image part (with text missing)
-        self.image_prompt_embeddings = nn.Parameter(torch.zeros(1,self.num_prompts, hs))
-        self.image_prompt_dropout=nn.Dropout(config['drop_rate'])
+        self.image_prompt_embeddings = nn.Parameter(torch.zeros(1,self.num_prompts, self.hs),requires_grad=True)
+        self.image_prompt_dropout=nn.Dropout(config['prompt_drop_rate'])
 
         #prompt embeddings for complete samples
-        self.complete_prompt_embeddings = nn.Parameter(torch.zeros(1,self.num_prompts, hs))
-        self.complete_prompt_dropout=nn.Dropout(config['drop_rate'])
+        self.complete_prompt_embeddings = nn.Parameter(torch.zeros(1,self.num_prompts, self.hs),requires_grad=True)
+        self.complete_prompt_dropout=nn.Dropout(config['prompt_drop_rate'])
 
         ### initialize the weights using xavier initialization ###
         if(self.initialization=='xavier'):
             self.initialize_weights(option=self.initialization)
+
+        elif(self.initialization=='kaiming'):
+            self.initialize_weights(option=self.initialization)
         # #initialize the text_prompt_embeddings
-        # nn.init.xavier_uniform_(self.text_prompt_embeddings)
 
         #number of classes
         self.num_classes = config["num_classes"]
@@ -1975,35 +1979,53 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
         self.transformer = getattr(vit, self.hparams.config["vit"])(
                 pretrained=False)
 
-    
+
         #classifier declaration
         self.classifier = nn.Sequential(
-                nn.Linear(hs, hs), #hs -> 2*hs
-                nn.LayerNorm(hs), 
+                nn.Linear(self.hs, self.hs), #hs -> 2*hs
+                nn.LayerNorm(self.hs), 
                 nn.GELU(),
-                nn.Linear(hs, self.num_classes)
+                nn.Linear(self.hs, self.num_classes)
             )
 
         #classifier initialization
         self.classifier.apply(objectives.init_weights)
 
 
-    def initialize_weights(self,option='xavier'):
+    def initialize_weights(self,option='xavier',patch_size=32,prompt_dim=768):
         if(option=='xavier'):
+            
             #initialize the text_prompt_embeddings
-            nn.init.xavier_uniform_(self.text_prompt_embeddings)
+            nn.init.xavier_uniform_(self.text_prompt_embeddings.data)
             #initialize the image_prompt_embeddings
-            nn.init.xavier_uniform_(self.image_prompt_embeddings)
+            nn.init.xavier_uniform_(self.image_prompt_embeddings.data)
             #initialize the complete_prompt_embeddings
-            nn.init.xavier_uniform_(self.complete_prompt_embeddings)
+            nn.init.xavier_uniform_(self.complete_prompt_embeddings.data)
 
+        elif(option=='kaiming'):
+            
+            #initialize the text_prompt_embeddings
+            nn.init.kaiming_uniform_(self.text_prompt_embeddings.data)
+            #initialize the image_prompt_embeddings
+            nn.init.kaiming_uniform_(self.image_prompt_embeddings.data)
+            #initialize the complete_prompt_embeddings
+            nn.init.kaiming_uniform_(self.complete_prompt_embeddings.data)
+
+        elif (option=='normal'):
+            val = math.sqrt(6. / float(3 * reduce(mul, patch_size, 1) + prompt_dim))
+            #initialize the text_prompt_embeddings
+            nn.init.normal_(self.text_prompt_embeddings.data,(-val,val))
+            #initialize the image_prompt_embeddings
+            nn.init.normal_(self.image_prompt_embeddings.data,(-val,val))
+            #initialize the complete_prompt_embeddings
+            nn.init.normal_(self.complete_prompt_embeddings.data,(-val,val))
 
     def handle_missing_image_modality(self,mmod_images,
-                                            mmod_text_embeds,
-                                            mmod_text_masks,
-                                            text_prompt_embeddings
-                                            image_token_type_idx):
-
+                                        mmod_text_embeds,
+                                        mmod_text_masks,
+                                        text_prompt_embeddings,
+                                        image_token_type_idx
+                                        ):
             #handle missing image modalities using the text prompt embeddings
             ####################################### creating the dummy tensort for the image tokens ########################################
             #maximum height of the images from the missing modality batches
@@ -2018,7 +2040,7 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
 
             #make zero tensors of (batch size, num_height_patches x num_width_patches, hidden_size)
             image_mmod_mask_len=num_height_patches*num_width_patches
-            mmod_image_embeds=torch.zeros(mmod_images.shape[0],image_mmod_mask_len,self.hparams.config['hidden_size']).to(self.config['device'])
+            mmod_image_embeds=torch.zeros(mmod_images.shape[0],image_mmod_mask_len,self.hs).to(self.config['device'])
 
             ####################################### creating the dummy tensort for the image masks ########################################
             #make zero tensors of (batch size, num_height_patches x num_width_patches)
@@ -2087,7 +2109,7 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
 
             combined_text_mmod_embeds = self.transformer.norm(combined_text_mmod_embeds)
 
-            mmod_image_feats = combined_text_mmod_embeds[:, mmod_text_embeds.shape[1]+num_prompts:]
+            mmod_image_feats = combined_text_mmod_embeds[:, mmod_text_embeds.shape[1]+self.num_prompts:]
 
             return mmod_text_embeds, mmod_image_feats
     
@@ -2100,6 +2122,7 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
         image_masks=None,
     ):
 
+        #print(self.complete_prompt_embeddings )
         #text embedding portion 
         text_ids = batch["text_ids"]
 
@@ -2115,7 +2138,7 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
 
         ## masks for complete prompt embeddings ##
         complete_prompt_masks=torch.ones(text_embeds.shape[0],
-                        hs).to(self.config['device']) #always ones
+                        self.hs).to(self.config['device']) #always ones
 
         if(self.mod_dropout_flag==False or (not any (mod_drop_flag)) ): #no modality dropout .... no need to use modality dropout mask
             
@@ -2141,7 +2164,7 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
             complete_masks=torch.cat((text_masks,complete_prompt_masks,image_masks),dim=1)
 
             for i, blk in enumerate(self.transformer.blocks):
-                complete_embeds, _attn = blk(complete_embeds, mask=complete_mask)
+                complete_embeds, _attn = blk(complete_embeds, mask=complete_masks)
 
 
             #take the first token here ###
@@ -2174,7 +2197,7 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
                         mmod_text_feats,mmod_image_embeds,image_mmod_mask_len = self.handle_missing_image_modality(mmod_images,
                                                        mmod_text_embeds,
                                                        mmod_text_masks,
-                                                       self.text_prompt_embeddings
+                                                       self.text_prompt_embeddings,
                                                        image_token_type_idx
                                                        )      
                         pool_token=torch.mean(mmod_text_feats,dim=1) #average pooling of the text features
@@ -2186,7 +2209,7 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
                         mmod_text_embeds,mmod_image_feats = self.handle_missing_text_modality(mmod_images,
                                                        mmod_text_embeds,
                                                        mmod_text_masks,
-                                                       self.image_prompt_embeddings
+                                                       self.image_prompt_embeddings,
                                                        image_token_type_idx
                                                        )      
                         pool_token=torch.mean(mmod_image_feats,dim=1)
@@ -2219,7 +2242,7 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
                                 ),dim=1)
 
                 #complete masks for the prompts###
-                compl_prompt_masks=torch.ones(compl_text_embeds.shape[0],num_prompts).to(self.config['device']) #always ones
+                compl_prompt_masks=torch.ones(compl_text_embeds.shape[0],self.num_prompts).to(self.config['device']) #always ones
                 
                 # complete embeddings + complete masks #
                 combined_embeds_compl_mask=torch.cat((compl_text_masks,compl_prompt_masks,compl_image_masks),dim=1)
@@ -2229,7 +2252,7 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
                     combined_embeds_compl, _attn = blk(combined_embeds_compl, mask=combined_embeds_compl_mask)
 
                 combined_embeds_compl = self.transformer.norm(combined_embeds_compl)
-                bn_image_feats_compl=combined_embeds_compl[:, compl_text_embeds.shape[1]+num_prompts:] #first part of the bottleneck tokens 
+                bn_image_feats_compl=combined_embeds_compl[:, compl_text_embeds.shape[1]+self.num_prompts:] #first part of the bottleneck tokens 
                 bn_text_feats_compl = combined_embeds_compl[:, 0:compl_text_embeds.shape[1]]
 
                 if(self.mod_choice=='image'):
@@ -2241,7 +2264,7 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
                                                        image_token_type_idx
                                                        )
 
-                    text_feats=torch.zeros(text_embeds.shape[0],text_embeds.shape[1],hs).to(self.config['device'])
+                    text_feats=torch.zeros(text_embeds.shape[0],text_embeds.shape[1],self.hs).to(self.config['device'])
                     text_feats[id_modality_complete,:]=bn_text_feats_compl
                     text_feats[id_modality_dropped,:]=mmod_text_feats
 
@@ -2254,7 +2277,7 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
                         #truncate the compl_image_embeds
                         bn_image_feats_compl=bn_image_feats_compl[:,:image_embeds_shape,:]
 
-                    image_feats=torch.zeros(text_embeds.shape[0],image_embeds_shape,hs).to(self.config['device'])
+                    image_feats=torch.zeros(text_embeds.shape[0],image_embeds_shape,self.hs).to(self.config['device'])
                     image_feats[id_modality_complete,:]=bn_image_feats_compl
                     image_feats[id_modality_dropped,:]=mmod_image_embeds
 
@@ -2263,18 +2286,19 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
                     text_feats_avg=torch.mean(text_feats,dim=1)
 
                     #average the cases from image_feats_avg and text_feats_avg when where both the modalities are present
-                    pool_token=torch.zeros(text_feats.shape[0],hs).to(self.config['device'])
+                    pool_token=torch.zeros(text_feats.shape[0],self.hs).to(self.config['device'])
                     pool_token[id_modality_complete,:]=0.5*(image_feats_avg[id_modality_complete,:]+text_feats_avg[id_modality_complete,:])
                     pool_token[id_modality_dropped,:]=text_feats_avg[id_modality_dropped,:]
 
 
                 elif(self.mod_choice=='text'):
 
-                    mmod_text_embeds,mmod_image_feats,image_mmod_mask_len = self.handle_missing_text_modality(mmod_images,
+                    mmod_text_embeds,mmod_image_feats = self.handle_missing_text_modality(mmod_images,
                                                        mmod_text_embeds,
                                                        mmod_text_masks,
-                                                       self.image_prompt_embeddings
-                                                       image_token_type_idx
+                                                       self.image_prompt_embeddings,
+                                                       image_token_type_idx,
+                                                        mask_image
                                                        )      
 
                     #dummy tensor where all the image features are stored
@@ -2287,12 +2311,12 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
                         bn_image_feats_compl=bn_image_feats_compl[:,:image_embeds_shape,:]
 
                     #image features 
-                    image_feats=torch.zeros(text_embeds.shape[0],image_embeds_shape,hs).to(self.config['device'])
+                    image_feats=torch.zeros(text_embeds.shape[0],image_embeds_shape,self.hs).to(self.config['device'])
                     image_feats[id_modality_complete,:]=bn_image_feats_compl
                     image_feats[id_modality_dropped,:]=mmod_image_feats
 
                     #create tensor for text features for both missing and complete modality samples
-                    text_feats=torch.zeros(text_embeds.shape[0],text_embeds.shape[1],hs).to(self.config['device'])
+                    text_feats=torch.zeros(text_embeds.shape[0],text_embeds.shape[1],self.hs).to(self.config['device'])
                     text_feats[id_modality_complete,:]=bn_text_feats_compl
                     text_feats[id_modality_dropped,:]=mmod_text_embeds
 
@@ -2301,7 +2325,7 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
                     text_feats_avg=torch.mean(text_feats,dim=1)
 
                     #average the cases from image_feats_avg and text_feats_avg when where both the modalities are present
-                    pool_token=torch.zeros(text_feats.shape[0],hs).to(self.config['device'])
+                    pool_token=torch.zeros(text_feats.shape[0],self.hs).to(self.config['device'])
                     pool_token[id_modality_complete,:]=0.5*(image_feats_avg[id_modality_complete,:]+text_feats_avg[id_modality_complete,:])
                     pool_token[id_modality_dropped,:]=image_feats_avg[id_modality_dropped,:]
 
