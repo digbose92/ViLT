@@ -1940,23 +1940,23 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
         self.mod_choice=config['mod_choice']
         self.initialization=config['initialization']
         hs=self.hparams.config["hidden_size"]
-        num_prompts=self.hparams.config["num_prompts"]
+        self.num_prompts=self.hparams.config["num_prompts"]
 
         #token type embeddings for the text part
-        self.token_type_embeddings = nn.Embedding(2, config["hidden_size"])
+        self.token_type_embeddings = nn.Embedding(2, hs)
         self.token_type_embeddings.apply(objectives.init_weights)
 
         ########################## keeping number of prompts same for now ############################  
         #prompt embeddings for the text part (with image missing)
-        self.text_prompt_embeddings = nn.Parameter(torch.zeros(1,num_prompts, hs))
+        self.text_prompt_embeddings = nn.Parameter(torch.zeros(1,self.num_prompts, hs))
         self.text_prompt_dropout=nn.Dropout(config['drop_rate'])
 
         #prompt embeddings for the image part (with text missing)
-        self.image_prompt_embeddings = nn.Parameter(torch.zeros(1,num_prompts, hs))
+        self.image_prompt_embeddings = nn.Parameter(torch.zeros(1,self.num_prompts, hs))
         self.image_prompt_dropout=nn.Dropout(config['drop_rate'])
 
         #prompt embeddings for complete samples
-        self.complete_prompt_embeddings = nn.Parameter(torch.zeros(1,num_prompts, hs))
+        self.complete_prompt_embeddings = nn.Parameter(torch.zeros(1,self.num_prompts, hs))
         self.complete_prompt_dropout=nn.Dropout(config['drop_rate'])
 
         ### initialize the weights using xavier initialization ###
@@ -1998,7 +1998,8 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
             nn.init.xavier_uniform_(self.complete_prompt_embeddings)
 
 
-    def handle_missing_image_modality(self,mmod_images,mmod_text_embeds,
+    def handle_missing_image_modality(self,mmod_images,
+                                            mmod_text_embeds,
                                             mmod_text_masks,
                                             text_prompt_embeddings
                                             image_token_type_idx):
@@ -2036,7 +2037,7 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
                             ),dim=1)
 
             image_mmod_mask_fwd_pass=torch.zeros(mmod_image_embeds.shape[0],image_mmod_mask_len).to(self.config['device'])
-            text_prompt_mask_fwd_pass=torch.ones(mmod_text_embeds.shape[0],num_prompts).to(self.config['device'])
+            text_prompt_mask_fwd_pass=torch.ones(mmod_text_embeds.shape[0],self.num_prompts).to(self.config['device'])
             total_mmod_mask_fwd_pass_image=torch.cat([mmod_text_masks,
                                             text_prompt_mask_fwd_pass,
                                             image_mmod_mask_fwd_pass],dim=1)
@@ -2078,7 +2079,7 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
                             ),dim=1)
 
             text_mmod_mask_fwd_pass=torch.zeros(mmod_text_embeds.shape[0],self.hparams.config['max_len']).to(self.config['device'])
-            image_prompt_mask_fwd_pass=torch.ones(mmod_image_embeds.shape[0],num_prompts).to(self.config['device'])
+            image_prompt_mask_fwd_pass=torch.ones(mmod_image_embeds.shape[0],self.num_prompts).to(self.config['device'])
             total_mmod_mask_fwd_pass_text=torch.cat([text_mmod_mask_fwd_pass,image_prompt_mask_fwd_pass,mmod_image_masks],dim=1)
 
             for i, blk in enumerate(self.transformer.blocks):
@@ -2086,7 +2087,7 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
 
             combined_text_mmod_embeds = self.transformer.norm(combined_text_mmod_embeds)
 
-            mmod_image_feats = combined_text_mmod_embeds[:, mmod_text_embeds.shape[1]:mmod_text_embeds.shape[1]+mmod_image_embeds.shape[1]]
+            mmod_image_feats = combined_text_mmod_embeds[:, mmod_text_embeds.shape[1]+num_prompts:]
 
             return mmod_text_embeds, mmod_image_feats
     
@@ -2115,13 +2116,6 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
         ## masks for complete prompt embeddings ##
         complete_prompt_masks=torch.ones(text_embeds.shape[0],
                         hs).to(self.config['device']) #always ones
-
-        ## masks for text prompt embeddings ##
-        text_prompt_masks=torch.ones(text_embeds.shape[0],hs).to(self.config['device']) #always ones
-
-        ## masks for image prompt embeddings ##
-        image_prompt_masks=torch.ones(text_embeds.shape[0],hs).to(self.config['device']) #always ones
-
 
         if(self.mod_dropout_flag==False or (not any (mod_drop_flag)) ): #no modality dropout .... no need to use modality dropout mask
             
@@ -2183,20 +2177,152 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
                                                        self.text_prompt_embeddings
                                                        image_token_type_idx
                                                        )      
-                        avg_token_feats=torch.mean(mmod_text_feats,dim=1) #average pooling of the text features
+                        pool_token=torch.mean(mmod_text_feats,dim=1) #average pooling of the text features
                         #we can take the first token here as well
 
-                    elif(self.mod_choice=="image"):
+                    elif(self.mod_choice=="text"):
 
-
-
-
-
-
+                        # image_prompt_embeddings=self.image_prompt_dropout(self.image_prompt_embeddings.expand(mmod_images.shape[0],-1,-1))
+                        mmod_text_embeds,mmod_image_feats = self.handle_missing_text_modality(mmod_images,
+                                                       mmod_text_embeds,
+                                                       mmod_text_masks,
+                                                       self.image_prompt_embeddings
+                                                       image_token_type_idx
+                                                       )      
+                        pool_token=torch.mean(mmod_image_feats,dim=1)
 
             else:
 
+                #attention between image, text and complete prompt embeddings
+                (
+                    compl_image_embeds,
+                    compl_image_masks,
+                        patch_index,
+                        image_labels,
+                ) = self.transformer.visual_embed(
+                        compl_images,
+                        max_image_len=self.hparams.config["max_image_len"],
+                        mask_it=mask_image
+                )
 
+                #include token type embeddings for the text and image tokens
+                compl_text_embeds, compl_image_embeds = (
+
+                    compl_text_embeds + self.token_type_embeddings(torch.zeros_like(compl_text_masks)),
+                    compl_image_embeds + self.token_type_embeddings(torch.full_like(compl_image_masks, image_token_type_idx))
+                )
+
+                #concatenate the text and image embeddings with the complete prompt embeddings
+                combined_embeds_compl=torch.cat((compl_text_embeds,
+                                self.complete_prompt_dropout(self.complete_prompt_embeddings.expand(compl_text_embeds.shape[0],-1,-1)),
+                                compl_image_embeds
+                                ),dim=1)
+
+                #complete masks for the prompts###
+                compl_prompt_masks=torch.ones(compl_text_embeds.shape[0],num_prompts).to(self.config['device']) #always ones
+                
+                # complete embeddings + complete masks #
+                combined_embeds_compl_mask=torch.cat((compl_text_masks,compl_prompt_masks,compl_image_masks),dim=1)
+
+                #### first forward pass for the complete modality samples ####
+                for i, blk in enumerate(self.transformer.blocks):
+                    combined_embeds_compl, _attn = blk(combined_embeds_compl, mask=combined_embeds_compl_mask)
+
+                combined_embeds_compl = self.transformer.norm(combined_embeds_compl)
+                bn_image_feats_compl=combined_embeds_compl[:, compl_text_embeds.shape[1]+num_prompts:] #first part of the bottleneck tokens 
+                bn_text_feats_compl = combined_embeds_compl[:, 0:compl_text_embeds.shape[1]]
+
+                if(self.mod_choice=='image'):
+
+                    mmod_text_feats,mmod_image_embeds, image_mmod_mask_len= self.handle_missing_image_modality(mmod_images,
+                                                       mmod_text_embeds,
+                                                       mmod_text_masks,
+                                                       self.text_prompt_embeddings,
+                                                       image_token_type_idx
+                                                       )
+
+                    text_feats=torch.zeros(text_embeds.shape[0],text_embeds.shape[1],hs).to(self.config['device'])
+                    text_feats[id_modality_complete,:]=bn_text_feats_compl
+                    text_feats[id_modality_dropped,:]=mmod_text_feats
+
+                    #dummy tensor where all the image features are stored
+                    image_embeds_shape=min(image_mmod_mask_len,bn_image_feats_compl.shape[1])
+                    if(image_embeds_shape==compl_image_embeds.shape[1]):
+                        #truncate the mmod_image_embeds
+                        mmod_image_embeds=mmod_image_embeds[:,:image_embeds_shape,:]
+                    else:
+                        #truncate the compl_image_embeds
+                        bn_image_feats_compl=bn_image_feats_compl[:,:image_embeds_shape,:]
+
+                    image_feats=torch.zeros(text_embeds.shape[0],image_embeds_shape,hs).to(self.config['device'])
+                    image_feats[id_modality_complete,:]=bn_image_feats_compl
+                    image_feats[id_modality_dropped,:]=mmod_image_embeds
+
+                    #for complete modality cases 
+                    image_feats_avg=torch.mean(image_feats,dim=1)
+                    text_feats_avg=torch.mean(text_feats,dim=1)
+
+                    #average the cases from image_feats_avg and text_feats_avg when where both the modalities are present
+                    pool_token=torch.zeros(text_feats.shape[0],hs).to(self.config['device'])
+                    pool_token[id_modality_complete,:]=0.5*(image_feats_avg[id_modality_complete,:]+text_feats_avg[id_modality_complete,:])
+                    pool_token[id_modality_dropped,:]=text_feats_avg[id_modality_dropped,:]
+
+
+                elif(self.mod_choice=='text'):
+
+                    mmod_text_embeds,mmod_image_feats,image_mmod_mask_len = self.handle_missing_text_modality(mmod_images,
+                                                       mmod_text_embeds,
+                                                       mmod_text_masks,
+                                                       self.image_prompt_embeddings
+                                                       image_token_type_idx
+                                                       )      
+
+                    #dummy tensor where all the image features are stored
+                    image_embeds_shape=min(mmod_image_feats.shape[1],bn_image_feats_compl.shape[1])
+                    if(image_embeds_shape==compl_image_embeds.shape[1]):
+                        #truncate the mmod_image_embeds
+                        mmod_image_feats=mmod_image_feats[:,:image_embeds_shape,:]
+                    else:
+                        #truncate the compl_image_embeds
+                        bn_image_feats_compl=bn_image_feats_compl[:,:image_embeds_shape,:]
+
+                    #image features 
+                    image_feats=torch.zeros(text_embeds.shape[0],image_embeds_shape,hs).to(self.config['device'])
+                    image_feats[id_modality_complete,:]=bn_image_feats_compl
+                    image_feats[id_modality_dropped,:]=mmod_image_feats
+
+                    #create tensor for text features for both missing and complete modality samples
+                    text_feats=torch.zeros(text_embeds.shape[0],text_embeds.shape[1],hs).to(self.config['device'])
+                    text_feats[id_modality_complete,:]=bn_text_feats_compl
+                    text_feats[id_modality_dropped,:]=mmod_text_embeds
+
+                    #for complete modality cases 
+                    image_feats_avg=torch.mean(image_feats,dim=1)
+                    text_feats_avg=torch.mean(text_feats,dim=1)
+
+                    #average the cases from image_feats_avg and text_feats_avg when where both the modalities are present
+                    pool_token=torch.zeros(text_feats.shape[0],hs).to(self.config['device'])
+                    pool_token[id_modality_complete,:]=0.5*(image_feats_avg[id_modality_complete,:]+text_feats_avg[id_modality_complete,:])
+                    pool_token[id_modality_dropped,:]=image_feats_avg[id_modality_dropped,:]
+
+            #pass it to classifier
+            cls_logits=self.classifier(pool_token)
+
+            return(cls_logits)
+
+    def forward(self, batch):
+
+        cls_logits=self.infer(batch)
+
+        return cls_logits
+
+                    
+
+
+
+
+
+                
 
 
 
