@@ -2138,7 +2138,7 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
 
         ## masks for complete prompt embeddings ##
         complete_prompt_masks=torch.ones(text_embeds.shape[0],
-                        self.hs).to(self.config['device']) #always ones
+                        self.num_prompts).to(self.config['device']) #always ones
 
         if(self.mod_dropout_flag==False or (not any (mod_drop_flag)) ): #no modality dropout .... no need to use modality dropout mask
             
@@ -2169,6 +2169,7 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
 
             #take the first token here ###
             pool_token=complete_embeds[:,0,:] #taking CLS of the combined sequence 
+            #print(pool_token.size())
 
         else:
 
@@ -2210,7 +2211,8 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
                                                        mmod_text_embeds,
                                                        mmod_text_masks,
                                                        self.image_prompt_embeddings,
-                                                       image_token_type_idx
+                                                       image_token_type_idx,
+                                                       mask_image
                                                        )      
                         pool_token=torch.mean(mmod_image_feats,dim=1)
 
@@ -2330,9 +2332,9 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
                     pool_token[id_modality_dropped,:]=image_feats_avg[id_modality_dropped,:]
 
             #pass it to classifier
-            cls_logits=self.classifier(pool_token)
+        cls_logits=self.classifier(pool_token)
 
-            return(cls_logits)
+        return(cls_logits)
 
     def forward(self, batch):
 
