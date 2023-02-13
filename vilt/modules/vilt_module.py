@@ -1943,6 +1943,8 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
         self.initialization=config['initialization']
         self.hs=self.hparams.config["hidden_size"]
         self.num_prompts=self.hparams.config["num_prompts"]
+        self.prompt_concat_option=self.hparams.config["prompt_concat_option"]
+        self.patch_size=self.hparams.config["patch_size"]
 
         #token type embeddings for the text part
         self.token_type_embeddings = nn.Embedding(2, self.hs)
@@ -1963,10 +1965,14 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
 
         ### initialize the weights using xavier initialization ###
         if(self.initialization=='xavier'):
-            self.initialize_weights(option=self.initialization)
+            self.initialize_weights(option=self.initialization, 
+                            patch_size=self.patch_size, 
+                            prompt_dim=self.hs)
 
         elif(self.initialization=='kaiming'):
-            self.initialize_weights(option=self.initialization)
+            self.initialize_weights(option=self.initialization, 
+                        patch_size=self.patch_size, 
+                        prompt_dim=self.hs)
         # #initialize the text_prompt_embeddings
 
         #number of classes
@@ -2052,16 +2058,27 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
                         mmod_image_embeds+ self.token_type_embeddings(torch.full_like(image_mmod_mask_fwd_pass, image_token_type_idx))
                     )
 
-            #conatenate the text and image embeddings with prompt embeddings for the text (used with image modality missing)
-            combined_img_mmod_embeds=torch.cat((mmod_text_embeds,
-                            self.text_prompt_dropout(text_prompt_embeddings.expand(mmod_text_embeds.shape[0],-1,-1)),
-                            mmod_image_embeds
-                            ),dim=1)
-
+            #concatenate the text and image embeddings with prompt embeddings for the text (used with image modality missing)
             image_mmod_mask_fwd_pass=torch.zeros(mmod_image_embeds.shape[0],image_mmod_mask_len).to(self.config['device'])
             text_prompt_mask_fwd_pass=torch.ones(mmod_text_embeds.shape[0],self.num_prompts).to(self.config['device'])
-            total_mmod_mask_fwd_pass_image=torch.cat([mmod_text_masks,
-                                            text_prompt_mask_fwd_pass,
+
+            if(self.prompt_concat_option=="middle"):
+                combined_img_mmod_embeds=torch.cat((mmod_text_embeds,
+                                self.text_prompt_dropout(text_prompt_embeddings.expand(mmod_text_embeds.shape[0],-1,-1)),
+                                mmod_image_embeds
+                                ),dim=1)
+                total_mmod_mask_fwd_pass_image=torch.cat([mmod_text_masks,
+                                                text_prompt_mask_fwd_pass,
+                                                image_mmod_mask_fwd_pass],dim=1)
+
+            elif(self.prompt_concat_option=="prepend"):
+
+                combined_img_mmod_embeds=torch.cat((self.text_prompt_dropout(text_prompt_embeddings.expand(mmod_text_embeds.shape[0],-1,-1)),
+                                mmod_text_embeds,
+                                mmod_image_embeds
+                                ),dim=1)
+                total_mmod_mask_fwd_pass_image=torch.cat([text_prompt_mask_fwd_pass,
+                                            mmod_text_masks,
                                             image_mmod_mask_fwd_pass],dim=1)
 
             #forward pass for text and bottleneck for the missing modality samples
@@ -2069,7 +2086,11 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
                 combined_img_mmod_embeds, _attn = blk(combined_img_mmod_embeds, mask=total_mmod_mask_fwd_pass_image)
             
             combined_img_mmod_embeds = self.transformer.norm(combined_img_mmod_embeds)
-            mmod_text_feats = combined_img_mmod_embeds[:, 0:mmod_text_embeds.shape[1]]
+
+            if(self.prompt_concat_option=="middle"):
+                mmod_text_feats = combined_img_mmod_embeds[:, 0:mmod_text_embeds.shape[1]]
+            elif(self.prompt_concat_option=="prepend"):
+                mmod_text_feats = combined_img_mmod_embeds[:, self.num_prompts:self.num_prompts+mmod_text_embeds.shape[1]]
 
             return mmod_text_feats, mmod_image_embeds, image_mmod_mask_len
 
@@ -2094,22 +2115,36 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
                     mmod_image_embeds + self.token_type_embeddings(torch.full_like(mmod_image_masks, image_token_type_idx))
             )
 
-            #conatenate the text and image embeddings with prompt embeddings for the image (used with text modality missing)
-            combined_text_mmod_embeds=torch.cat((mmod_text_embeds,
-                            self.image_prompt_dropout(image_prompt_embeddings.expand(mmod_text_embeds.shape[0],-1,-1)),
-                            mmod_image_embeds
-                            ),dim=1)
-
             text_mmod_mask_fwd_pass=torch.zeros(mmod_text_embeds.shape[0],self.hparams.config['max_len']).to(self.config['device'])
             image_prompt_mask_fwd_pass=torch.ones(mmod_image_embeds.shape[0],self.num_prompts).to(self.config['device'])
-            total_mmod_mask_fwd_pass_text=torch.cat([text_mmod_mask_fwd_pass,image_prompt_mask_fwd_pass,mmod_image_masks],dim=1)
+
+            if(self.prompt_concat_option=="middle"):
+                #conatenate the text and image embeddings with prompt embeddings for the image (used with text modality missing)
+                combined_text_mmod_embeds=torch.cat((mmod_text_embeds,
+                                self.image_prompt_dropout(image_prompt_embeddings.expand(mmod_text_embeds.shape[0],-1,-1)),
+                                mmod_image_embeds
+                                ),dim=1)
+            
+                total_mmod_mask_fwd_pass_text=torch.cat([text_mmod_mask_fwd_pass,image_prompt_mask_fwd_pass,mmod_image_masks],dim=1)
+
+            elif(self.prompt_concat_option=="prepend"):
+
+                combined_text_mmod_embeds=torch.cat((self.image_prompt_dropout(image_prompt_embeddings.expand(mmod_text_embeds.shape[0],-1,-1)),
+                                mmod_text_embeds,
+                                mmod_image_embeds
+                                ),dim=1)
+                total_mmod_mask_fwd_pass_text=torch.cat([image_prompt_mask_fwd_pass,text_mmod_mask_fwd_pass,mmod_image_masks],dim=1)
+
 
             for i, blk in enumerate(self.transformer.blocks):
                 combined_text_mmod_embeds, _attn = blk(combined_text_mmod_embeds, mask=total_mmod_mask_fwd_pass_text)
 
             combined_text_mmod_embeds = self.transformer.norm(combined_text_mmod_embeds)
 
-            mmod_image_feats = combined_text_mmod_embeds[:, mmod_text_embeds.shape[1]+self.num_prompts:]
+            if(self.prompt_concat_option=="middle"):
+                mmod_image_feats = combined_text_mmod_embeds[:, mmod_text_embeds.shape[1]+self.num_prompts:]
+            elif(self.prompt_concat_option=="prepend"):
+                mmod_image_feats = combined_text_mmod_embeds[:, self.num_prompts+mmod_text_embeds.shape[1]:]
 
             return mmod_text_embeds, mmod_image_feats
     
@@ -2154,18 +2189,26 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
                     image_embeds + self.token_type_embeddings(torch.full_like(image_masks, image_token_type_idx))
             )
 
-            #concatenate the text and image embeddings with the complete prompt embeddings
-            complete_embeds=torch.cat((text_embeds,
-                            self.complete_prompt_dropout(self.complete_prompt_embeddings.expand(text_embeds.shape[0],-1,-1)),
-                            image_embeds
-                            ),dim=1)
 
-            ### conatenate the masks #####
-            complete_masks=torch.cat((text_masks,complete_prompt_masks,image_masks),dim=1)
+            if(self.prompt_concat_option=="middle"):
+                #concatenate the text and image embeddings with the complete prompt embeddings
+                complete_embeds=torch.cat((text_embeds,
+                                self.complete_prompt_dropout(self.complete_prompt_embeddings.expand(text_embeds.shape[0],-1,-1)),
+                                image_embeds
+                                ),dim=1)
+                ### concatenate the masks #####
+                complete_masks=torch.cat((text_masks,complete_prompt_masks,image_masks),dim=1)
+            
+            elif(self.prompt_concat_option=="prepend"):
+
+                complete_embeds=torch.cat((self.complete_prompt_dropout(self.complete_prompt_embeddings.expand(text_embeds.shape[0],-1,-1)),
+                                text_embeds,
+                                image_embeds
+                                ),dim=1)
+                complete_masks=torch.cat((complete_prompt_masks,text_masks,image_masks),dim=1)
 
             for i, blk in enumerate(self.transformer.blocks):
                 complete_embeds, _attn = blk(complete_embeds, mask=complete_masks)
-
 
             #take the first token here ###
             pool_token=complete_embeds[:,0,:] #taking CLS of the combined sequence 
@@ -2236,26 +2279,47 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
                     compl_text_embeds + self.token_type_embeddings(torch.zeros_like(compl_text_masks)),
                     compl_image_embeds + self.token_type_embeddings(torch.full_like(compl_image_masks, image_token_type_idx))
                 )
-
-                #concatenate the text and image embeddings with the complete prompt embeddings
-                combined_embeds_compl=torch.cat((compl_text_embeds,
-                                self.complete_prompt_dropout(self.complete_prompt_embeddings.expand(compl_text_embeds.shape[0],-1,-1)),
-                                compl_image_embeds
-                                ),dim=1)
-
+                
                 #complete masks for the prompts###
                 compl_prompt_masks=torch.ones(compl_text_embeds.shape[0],self.num_prompts).to(self.config['device']) #always ones
-                
-                # complete embeddings + complete masks #
-                combined_embeds_compl_mask=torch.cat((compl_text_masks,compl_prompt_masks,compl_image_masks),dim=1)
+                #concatenate the text and image embeddings with the complete prompt embeddings
 
-                #### first forward pass for the complete modality samples ####
-                for i, blk in enumerate(self.transformer.blocks):
-                    combined_embeds_compl, _attn = blk(combined_embeds_compl, mask=combined_embeds_compl_mask)
+                if(self.prompt_concat_option=="middle"):
+                    combined_embeds_compl=torch.cat((compl_text_embeds,
+                                    self.complete_prompt_dropout(self.complete_prompt_embeddings.expand(compl_text_embeds.shape[0],-1,-1)),
+                                    compl_image_embeds
+                                    ),dim=1)
 
-                combined_embeds_compl = self.transformer.norm(combined_embeds_compl)
-                bn_image_feats_compl=combined_embeds_compl[:, compl_text_embeds.shape[1]+self.num_prompts:] #first part of the bottleneck tokens 
-                bn_text_feats_compl = combined_embeds_compl[:, 0:compl_text_embeds.shape[1]]
+                    # complete embeddings + complete masks #
+                    combined_embeds_compl_mask=torch.cat((compl_text_masks,compl_prompt_masks,compl_image_masks),dim=1)
+
+                    #### first forward pass for the complete modality samples ####
+                    for i, blk in enumerate(self.transformer.blocks):
+                        combined_embeds_compl, _attn = blk(combined_embeds_compl, mask=combined_embeds_compl_mask)
+
+                    combined_embeds_compl = self.transformer.norm(combined_embeds_compl)
+                    bn_image_feats_compl=combined_embeds_compl[:, compl_text_embeds.shape[1]+self.num_prompts:] #first part of the bottleneck tokens 
+                    bn_text_feats_compl = combined_embeds_compl[:, 0:compl_text_embeds.shape[1]]
+
+                elif(self.prompt_concat_option=="prepend"):
+                    
+                    combined_embeds_compl=torch.cat((self.complete_prompt_dropout(self.complete_prompt_embeddings.expand(compl_text_embeds.shape[0],-1,-1)),
+                                    compl_text_embeds,
+                                    compl_image_embeds
+                                    ),dim=1)
+                    
+                    # complete embeddings + complete masks #
+                    combined_embeds_compl_mask=torch.cat((compl_prompt_masks,compl_text_masks,compl_image_masks),dim=1)
+
+                    #### first forward pass for the complete modality samples ####
+                    #### first forward pass for the complete modality samples ####
+                    for i, blk in enumerate(self.transformer.blocks):
+                        combined_embeds_compl, _attn = blk(combined_embeds_compl, mask=combined_embeds_compl_mask)
+
+                    combined_embeds_compl = self.transformer.norm(combined_embeds_compl)
+                    bn_image_feats_compl=combined_embeds_compl[:, compl_text_embeds.shape[1]+self.num_prompts:] #first part of the bottleneck tokens
+                    bn_text_feats_compl = combined_embeds_compl[:, self.num_prompts:self.num_prompts+compl_text_embeds.shape[1]]
+
 
                 if(self.mod_choice=='image'):
 
