@@ -2407,6 +2407,227 @@ class ViLT_multi_prompt_missing_mod_token_average(pl.LightningModule):
         return cls_logits
 
                     
+class ViLT_multi_deep_prompt_missing_mod_token_average(pl.LightningModule):
+
+    def __init__(self, config):
+        super().__init__()
+        self.save_hyperparameters() #specific to pytorch lightning 
+        self.config=config
+
+        #bert config for the text part 
+        bert_config = BertConfig(
+            vocab_size=config["vocab_size"],
+            hidden_size=config["hidden_size"],
+            num_hidden_layers=config["num_layers"],
+            num_attention_heads=config["num_heads"],
+            intermediate_size=config["hidden_size"] * config["mlp_ratio"], 
+            max_position_embeddings=config["max_text_len"], #keep this max_text_len=40 to initialize the pretrained vilt weights
+            hidden_dropout_prob=config["drop_rate"],
+            attention_probs_dropout_prob=config["drop_rate"],
+        )
+        
+        #text_embeddings declared here
+        self.text_embeddings = BertEmbeddings(bert_config)
+        self.text_embeddings.apply(objectives.init_weights)
+        self.mod_dropout_flag=config['mod_dropout_flag']
+        self.mod_choice=config['mod_choice']
+        self.initialization=config['initialization']
+        self.hs=self.hparams.config["hidden_size"]
+        self.num_prompts=self.hparams.config["num_prompts"]
+        self.patch_size=self.hparams.config["patch_size"]
+        self.num_layers=self.hparams.config["num_layers"]
+        self.prompt_drop_rate=self.hparams.config["prompt_drop_rate"]
+        self.total_num_layers=self.hparams.config["total_num_layers"]-1
+
+        #token type embeddings for the text part
+        self.token_type_embeddings = nn.Embedding(2, self.hs)
+        self.token_type_embeddings.apply(objectives.init_weights)
+
+        ########################## keeping number of prompts same for now ############################  
+        ############################prompt embeddings for the text part (with image missing)#########################################
+        self.text_prompt_deep_embeddings = nn.Parameter(torch.zeros(self.total_num_layers,self.num_prompts,self.hs),requires_grad=True)
+        self.text_prompt_dropout=nn.Dropout(self.prompt_drop_rate)
+        #prompt embeddings for the text part (with image missing) -- initial prompt
+        self.text_prompt_init_embeddings = nn.Parameter(torch.zeros(1,self.num_prompts,self.hs),requires_grad=True)
+
+        #####################################prompt embeddings for the image part (with text missing) #######################################
+        self.image_prompt_deep_embeddings = nn.Parameter(torch.zeros(self.total_num_layers,self.num_prompts,self.hs),requires_grad=True)
+        self.image_prompt_dropout=nn.Dropout(self.prompt_drop_rate)
+        #prompt embeddings for the image part (with text missing) -- initial prompt
+        self.image_prompt_init_embeddings = nn.Parameter(torch.zeros(1,self.num_prompts,self.hs),requires_grad=True)
+
+        ################################################prompt embeddings for complete samples ##########################################
+        self.complete_prompt_deep_embeddings = nn.Parameter(torch.zeros(self.total_num_layers,self.num_prompts,self.hs),requires_grad=True)
+        self.complete_prompt_dropout=nn.Dropout(self.prompt_drop_rate)
+        #prompt embeddings for the image part with text part
+        self.complete_prompt_init_embeddings = nn.Parameter(torch.zeros(1,self.num_prompts,self.hs),requires_grad=True)
+
+        ### initialize the weights using xavier initialization ###
+        if(self.initialization=='xavier'):
+            self.initialize_weights(option=self.initialization, 
+                            patch_size=self.patch_size, 
+                            prompt_dim=self.hs)
+
+        elif(self.initialization=='kaiming'):
+            self.initialize_weights(option=self.initialization, 
+                        patch_size=self.patch_size, 
+                        prompt_dim=self.hs)
+
+        #number of classes
+        self.num_classes = config["num_classes"]
+
+        #patch size
+        self.patch_size = self.hparams.config["patch_size"]
+        
+        # transformer 
+        self.transformer = getattr(vit, self.hparams.config["vit"])(
+                pretrained=False)
+
+        #classifier declaration
+        self.classifier = nn.Sequential(
+                nn.Linear(self.hs, self.hs), #hs -> 2*hs
+                nn.LayerNorm(self.hs), 
+                nn.GELU(),
+                nn.Linear(self.hs, self.num_classes)
+            )
+
+        #classifier initialization
+        self.classifier.apply(objectives.init_weights)
+
+        #initialize the weights of the Parameters
+        def initialize_weights(self,option='xavier',patch_size=32,prompt_dim=768):
+            if(option=='xavier'):
+                
+                #initialize the text_prompt_embeddings
+                nn.init.xavier_uniform_(self.text_prompt_deep_embeddings.data)
+                nn.init.xavier_uniform_(self.text_prompt_init_embeddings.data)
+
+                #initialize the image_prompt_embeddings
+                nn.init.xavier_uniform_(self.image_prompt_deep_embeddings.data)
+                nn.init.xavier_uniform_(self.image_prompt_init_embeddings.data)
+
+                #initialize the complete_prompt_embeddings
+                nn.init.xavier_uniform_(self.complete_prompt_deep_embeddings.data)
+                nn.init.xavier_uniform_(self.complete_prompt_init_embeddings.data)
+
+
+            elif(option=='kaiming'):
+                
+                #initialize the text_prompt_embeddings
+                nn.init.kaiming_uniform_(self.text_prompt_deep_embeddings.data)
+                nn.init.kaiming_uniform_(self.text_prompt_init_embeddings.data)
+
+                #initialize the image_prompt_embeddings
+                nn.init.kaiming_uniform_(self.image_prompt_deep_embeddings.data)
+                nn.init.kaiming_uniform_(self.image_prompt_init_embeddings.data)
+
+                #initialize the complete_prompt_embeddings
+                nn.init.kaiming_uniform_(self.complete_prompt_deep_embeddings.data)
+                nn.init.kaiming_uniform_(self.complete_prompt_init_embeddings.data)
+
+            elif (option=='normal'):
+                val = math.sqrt(6. / float(3 * reduce(mul, patch_size, 1) + prompt_dim))
+                #initialize the text_prompt_embeddings
+                nn.init.normal_(self.text_prompt_deep_embeddings.data,(-val,val))
+                nn.init.normal_(self.text_prompt_init_embeddings.data,(-val,val))
+
+                #initialize the image_prompt_embeddings
+                nn.init.normal_(self.image_prompt_deep_embeddings.data,(-val,val))
+                nn.init.normal_(self.image_prompt_init_embeddings.data,(-val,val))
+
+                #initialize the complete_prompt_embeddings
+                nn.init.normal_(self.complete_prompt_deep_embeddings.data,(-val,val))
+                nn.init.normal_(self.complete_prompt_init_embeddings.data,(-val,val))
+
+        def handle_missing_image_modality(self,mmod_images,
+                                        mmod_text_embeds,
+                                        mmod_text_masks,
+                                        text_prompt_embeddings,
+                                        image_token_type_idx
+                                        ):
+            #handle missing image modalities using the text prompt embeddings
+            ####################################### creating the dummy tensort for the image tokens ########################################
+            #maximum height of the images from the missing modality batches
+            max_height= max([img.shape[1] for img in mmod_images])
+            #maximum width of the images from the missing modality batches
+            max_width= max([img.shape[2] for img in mmod_images])
+
+            #num width patches
+            num_width_patches=(max_width//self.hparams.config['patch_size'])
+            #num height patches
+            num_height_patches=(max_height//self.hparams.config['patch_size'])
+
+            #make zero tensors of (batch size, num_height_patches x num_width_patches, hidden_size)
+            image_mmod_mask_len=num_height_patches*num_width_patches
+            mmod_image_embeds=torch.zeros(mmod_images.shape[0],image_mmod_mask_len,self.hs).to(self.config['device'])
+
+            ####################################### creating the dummy tensort for the image masks ########################################
+            #make zero tensors of (batch size, num_height_patches x num_width_patches)
+            image_mmod_mask_fwd_pass=torch.zeros(mmod_images.shape[0],image_mmod_mask_len,dtype=torch.long).to(self.config['device'])
+                    
+            #include token type embeddings for the image tokens
+            mmod_text_embeds, mmod_image_embeds = (
+                        mmod_text_embeds + self.token_type_embeddings(torch.zeros_like(mmod_text_masks)),
+                        mmod_image_embeds+ self.token_type_embeddings(torch.full_like(image_mmod_mask_fwd_pass, image_token_type_idx))
+                    )
+
+            #concatenate the text and image embeddings with prompt embeddings for the text (used with image modality missing)
+            image_mmod_mask_fwd_pass=torch.zeros(mmod_image_embeds.shape[0],image_mmod_mask_len).to(self.config['device'])
+            text_prompt_mask_fwd_pass=torch.ones(mmod_text_embeds.shape[0],self.num_prompts).to(self.config['device'])
+
+            #elif(self.prompt_concat_option=="prepend"):
+
+            ##### prepend the inital prompt embeddings to the text and image embeddings #####
+            combined_img_mmod_embeds_init=torch.cat((self.text_prompt_dropout(text_prompt_embeddings.expand(mmod_text_embeds.shape[0],-1,-1)),
+                                mmod_text_embeds,
+                                mmod_image_embeds
+                                ),dim=1)
+            total_mmod_mask_fwd_pass_image=torch.cat([text_prompt_mask_fwd_pass,
+                                            mmod_text_masks,
+                                            image_mmod_mask_fwd_pass],dim=1)
+                                            
+            #forward pass for text and bottleneck for the missing modality samples
+            for i, blk in enumerate(self.transformer.blocks):
+
+                if(i==0):
+                    combined_img_mmod_embeds, _attn = blk(combined_img_mmod_embeds_init, mask=total_mmod_mask_fwd_pass_image)
+                else:
+                    #add the prompts for specific layers
+                    if(i<=self.text_prompt_deep_embeddings.shape[0]):
+
+                        deep_text_prompt_embed= self.text_prompt_dropout(self.text_prompt_deep_embeddings[i-1].expand(mmod_text_embeds.shape[0],-1,-1))
+                        combined_img_mmod_embeds=torch.cat((deep_text_prompt_embed,
+                                                            combined_img_mmod_embeds[:,self.num_prompts:self.num_prompts+mmod_text_embeds.shape[0],:],
+                                                            combined_img_mmod_embeds[:,self.num_prompts+mmod_text_embeds.shape[0]:,:]
+                                                            ),dim=1)
+
+                        #forward pass for text and bottleneck for the missing modality samples
+                    combined_img_mmod_embeds, _attn = blk(combined_img_mmod_embeds, mask=total_mmod_mask_fwd_pass_image)
+            
+            combined_img_mmod_embeds = self.transformer.norm(combined_img_mmod_embeds)
+
+            
+            mmod_text_feats = combined_img_mmod_embeds[:, self.num_prompts:self.num_prompts+mmod_text_embeds.shape[1]]
+
+            return mmod_text_feats, mmod_image_embeds, image_mmod_mask_len
+
+        
+
+        
+
+
+
+
+
+        
+
+
+
+
+
+
+
+
 
 
 
