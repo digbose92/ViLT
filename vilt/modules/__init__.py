@@ -5,4 +5,5 @@ from .vilt_module import ViLTTransformer_token_aggregate
 from .vilt_module import ViLTTransformerBN_modality_token_average
 from .vilt_module import ViLTTransformerBN_free_attention_modality_token_average
 from .vilt_module import ViLT_multi_prompt_missing_mod_token_average
+from .vilt_module import ViLT_multi_deep_prompt_missing_mod_token_average
 
