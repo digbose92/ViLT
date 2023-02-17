@@ -2556,8 +2556,7 @@ class ViLT_multi_deep_prompt_missing_mod_token_average(pl.LightningModule):
 
             ####################################### creating the dummy tensort for the image masks ########################################
             #make zero tensors of (batch size, num_height_patches x num_width_patches)
-            image_mmod_mask_fwd_pass=torch.zeros(mmod_images.shape[0],image_mmod_mask_len,dtype=torch.long).to(self.config['device'])
-                    
+            image_mmod_mask_fwd_pass=torch.zeros(mmod_image_embeds.shape[0],image_mmod_mask_len,dtype=torch.long).to(self.config['device'])
             #include token type embeddings for the image tokens
             mmod_text_embeds, mmod_image_embeds = (
                         mmod_text_embeds + self.token_type_embeddings(torch.zeros_like(mmod_text_masks)),
@@ -2565,8 +2564,8 @@ class ViLT_multi_deep_prompt_missing_mod_token_average(pl.LightningModule):
                     )
 
             #concatenate the text and image embeddings with prompt embeddings for the text (used with image modality missing)
-            image_mmod_mask_fwd_pass=torch.zeros(mmod_image_embeds.shape[0],image_mmod_mask_len).to(self.config['device'])
-            text_prompt_mask_fwd_pass=torch.ones(mmod_text_embeds.shape[0],self.num_prompts).to(self.config['device'])
+            
+            text_prompt_mask_fwd_pass=torch.ones(mmod_text_embeds.shape[0],self.num_prompts).to(self.config['device'],dtype=torch.long)
 
             #elif(self.prompt_concat_option=="prepend"):
 
@@ -2580,7 +2579,7 @@ class ViLT_multi_deep_prompt_missing_mod_token_average(pl.LightningModule):
                                             image_mmod_mask_fwd_pass],dim=1)
                                             
             #forward pass for text and bottleneck for the missing modality samples
-            for i in range(self.num_layers):
+            for i in range(self.layers):
 
                 if(i==0):
                     combined_img_mmod_embeds, _attn = self.transformer.blocks[i](combined_img_mmod_embeds_init, mask=total_mmod_mask_fwd_pass_image)
@@ -2590,8 +2589,8 @@ class ViLT_multi_deep_prompt_missing_mod_token_average(pl.LightningModule):
 
                         deep_text_prompt_embed= self.text_prompt_dropout(self.text_prompt_deep_embeddings[i-1].expand(mmod_text_embeds.shape[0],-1,-1))
                         combined_img_mmod_embeds=torch.cat((deep_text_prompt_embed,
-                                                            combined_img_mmod_embeds[:,self.num_prompts:self.num_prompts+mmod_text_embeds.shape[0],:],
-                                                            combined_img_mmod_embeds[:,self.num_prompts+mmod_text_embeds.shape[0]:,:]
+                                                            combined_img_mmod_embeds[:,self.num_prompts:self.num_prompts+mmod_text_embeds.shape[1],:],
+                                                            combined_img_mmod_embeds[:,self.num_prompts+mmod_text_embeds.shape[1]:,:]
                                                             ),dim=1)
 
                         #forward pass for text and bottleneck for the missing modality samples
@@ -2631,7 +2630,7 @@ class ViLT_multi_deep_prompt_missing_mod_token_average(pl.LightningModule):
                                 mmod_image_embeds
                                 ),dim=1)
             total_mmod_mask_fwd_pass_text=torch.cat([image_prompt_mask_fwd_pass,text_mmod_mask_fwd_pass,mmod_image_masks],dim=1)
-
+            #print(mmod_image_embeds.shape)
 
             for i in range(self.layers):
                 if(i==0):
@@ -2640,9 +2639,10 @@ class ViLT_multi_deep_prompt_missing_mod_token_average(pl.LightningModule):
                     if(i<=self.image_prompt_deep_embeddings.shape[0]):
                         deep_image_prompt_embed= self.image_prompt_dropout(self.image_prompt_deep_embeddings[i-1].expand(mmod_text_embeds.shape[0],-1,-1))
                         combined_text_mmod_embeds=torch.cat((deep_image_prompt_embed,
-                                                            combined_text_mmod_embeds[:,self.num_prompts:self.num_prompts+mmod_text_embeds.shape[0],:],
-                                                            combined_text_mmod_embeds[:,self.num_prompts+mmod_text_embeds.shape[0]:,:]
+                                                            combined_text_mmod_embeds[:,self.num_prompts:self.num_prompts+mmod_text_embeds.shape[1],:],
+                                                            combined_text_mmod_embeds[:,self.num_prompts+mmod_text_embeds.shape[1]:,:]
                                                             ),dim=1)
+                        #print(combined_text_mmod_embeds.shape)
                     
                     combined_text_mmod_embeds, _attn = self.transformer.blocks[i](combined_text_mmod_embeds, mask=total_mmod_mask_fwd_pass_text)
 
@@ -2693,7 +2693,7 @@ class ViLT_multi_deep_prompt_missing_mod_token_average(pl.LightningModule):
                     image_embeds + self.token_type_embeddings(torch.full_like(image_masks, image_token_type_idx))
             )
 
-            complete_embeds_init=torch.cat((self.complete_prompt_dropout(self.complete_prompt_deep_embeddings.expand(text_embeds.shape[0],-1,-1)),
+            complete_embeds_init=torch.cat((self.complete_prompt_dropout(self.complete_prompt_init_embeddings.expand(text_embeds.shape[0],-1,-1)),
                                 text_embeds,
                                 image_embeds
                                 ),dim=1)
@@ -2704,14 +2704,14 @@ class ViLT_multi_deep_prompt_missing_mod_token_average(pl.LightningModule):
 
             for i in range(self.layers):
                 if(i==0):
-                    combined_embeds, _attn = self.transformer.blocks[i](combined_embeds_init, mask=complete_masks)
+                    combined_embeds, _attn = self.transformer.blocks[i](complete_embeds_init, mask=complete_masks)
                 else:
                     if(i<=self.complete_prompt_deep_embeddings.shape[0]):
                         
                         deep_complete_prompt_embed= self.complete_prompt_dropout(self.complete_prompt_deep_embeddings[i-1].expand(text_embeds.shape[0],-1,-1))
                         combined_embeds=torch.cat((deep_complete_prompt_embed,
-                                                            combined_embeds[:,self.num_prompts:self.num_prompts+text_embeds.shape[0],:],
-                                                            combined_embeds[:,self.num_prompts+text_embeds.shape[0]:,:]
+                                                            combined_embeds[:,self.num_prompts:self.num_prompts+text_embeds.shape[1],:],
+                                                            combined_embeds[:,self.num_prompts+text_embeds.shape[1]:,:]
                                                             ),dim=1)
 
                     combined_embeds, _attn = self.transformer.blocks[i](combined_embeds, mask=complete_masks)
@@ -2805,8 +2805,8 @@ class ViLT_multi_deep_prompt_missing_mod_token_average(pl.LightningModule):
                         if(i<=self.complete_prompt_deep_embeddings.shape[0]):
                             deep_complete_prompt_embed= self.complete_prompt_dropout(self.complete_prompt_deep_embeddings[i-1].expand(compl_text_embeds.shape[0],-1,-1))
                             combined_embeds_compl=torch.cat((deep_complete_prompt_embed,
-                                                                combined_embeds_compl[:,self.num_prompts:self.num_prompts+text_embeds.shape[0],:],
-                                                                combined_embeds_compl[:,self.num_prompts+text_embeds.shape[0]:,:]
+                                                                combined_embeds_compl[:,self.num_prompts:self.num_prompts+text_embeds.shape[1],:],
+                                                                combined_embeds_compl[:,self.num_prompts+text_embeds.shape[1]:,:]
                                                                 ),dim=1)
 
                         combined_embeds_compl, _attn = self.transformer.blocks[i](combined_embeds_compl, mask=combined_embeds_compl_mask)
@@ -2900,18 +2900,7 @@ class ViLT_multi_deep_prompt_missing_mod_token_average(pl.LightningModule):
 
         return cls_logits
 
-        
-
-
-
-
-
-        
-
-
-
-
-
+    
 
 
 
