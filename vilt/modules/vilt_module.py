@@ -2715,7 +2715,8 @@ class ViLT_multi_deep_prompt_missing_mod_token_average(pl.LightningModule):
                                                             ),dim=1)
 
                     combined_embeds, _attn = self.transformer.blocks[i](combined_embeds, mask=complete_masks)
-
+            
+            combined_embeds = self.transformer.norm(combined_embeds)
             #take the first token here ###
             pool_token=combined_embeds[:,0,:] #taking CLS of the combined sequence 
             #print(pool_token.size())
@@ -2901,6 +2902,505 @@ class ViLT_multi_deep_prompt_missing_mod_token_average(pl.LightningModule):
         return cls_logits
 
     
+
+###### deep version of prompting with multiple prompts per layer and specific to different types of modalities with special CLS token ##### 
+########################## updates from previous version include (1) usage of normal vilt operation for complete samples ##############################
+############################################## provide mask of all ones for the CLS token addded before the set of prompts ###########################################
+
+
+class ViLT_multi_deep_prompt_missing_mod_token_head(pl.LightningModule):
+
+    def __init__(self, config):
+        super().__init__()
+        self.save_hyperparameters() #specific to pytorch lightning 
+        self.config=config
+
+        #bert config for the text part 
+        bert_config = BertConfig(
+            vocab_size=config["vocab_size"],
+            hidden_size=config["hidden_size"],
+            num_hidden_layers=config["num_layers"],
+            num_attention_heads=config["num_heads"],
+            intermediate_size=config["hidden_size"] * config["mlp_ratio"], 
+            max_position_embeddings=config["max_text_len"], #keep this max_text_len=40 to initialize the pretrained vilt weights
+            hidden_dropout_prob=config["drop_rate"],
+            attention_probs_dropout_prob=config["drop_rate"],
+        )
+        
+        #text_embeddings declared here
+        self.text_embeddings = BertEmbeddings(bert_config)
+        self.text_embeddings.apply(objectives.init_weights)
+        self.mod_dropout_flag=config['mod_dropout_flag']
+        self.mod_choice=config['mod_choice']
+        self.initialization=config['initialization']
+        self.hs=self.hparams.config["hidden_size"]
+        self.num_prompts=self.hparams.config["num_prompts"]
+        self.patch_size=self.hparams.config["patch_size"]
+        self.layers=self.hparams.config["num_layers"]
+        self.prompt_drop_rate=self.hparams.config["prompt_drop_rate"]
+        self.total_num_layers=self.layers-1
+
+        #token type embeddings for the text part
+        self.token_type_embeddings = nn.Embedding(2, self.hs)
+        self.token_type_embeddings.apply(objectives.init_weights)
+
+        ########################## keeping number of prompts same for now ############################  
+        ############################prompt embeddings for the text part (with image missing)#########################################
+        self.text_prompt_deep_embeddings = nn.Parameter(torch.zeros(self.total_num_layers,self.num_prompts,self.hs),requires_grad=True)
+        self.text_prompt_dropout=nn.Dropout(self.prompt_drop_rate)
+        self.text_prompt_init_embeddings = nn.Parameter(torch.zeros(1,self.num_prompts,self.hs),requires_grad=True)
+
+        #####################################prompt embeddings for the image part (with text missing) #######################################
+        self.image_prompt_deep_embeddings = nn.Parameter(torch.zeros(self.total_num_layers,self.num_prompts,self.hs),requires_grad=True)
+        self.image_prompt_dropout=nn.Dropout(self.prompt_drop_rate)
+        self.image_prompt_init_embeddings = nn.Parameter(torch.zeros(1,self.num_prompts,self.hs),requires_grad=True)
+
+        ### initialize the weights using xavier,kaiming,normal initialization ###
+        self.initialize_weights(option=self.initialization, 
+                            patch_size=self.patch_size, 
+                            prompt_dim=self.hs)
+
+        #number of classes
+        self.num_classes = config["num_classes"]
+
+        #patch size
+        self.patch_size = self.hparams.config["patch_size"]
+        
+        # transformer 
+        self.transformer = getattr(vit, self.hparams.config["vit"])(
+                pretrained=False)
+
+        #classifier declaration
+        self.classifier = nn.Sequential(
+                nn.Linear(self.hs, self.hs), #hs -> 2*hs
+                nn.LayerNorm(self.hs), 
+                nn.GELU(),
+                nn.Linear(self.hs, self.num_classes)
+            )
+
+        #classifier initialization
+        self.classifier.apply(objectives.init_weights)
+
+    #initialize the weights of the Parameters
+    def initialize_weights(self,option='xavier',patch_size=32,prompt_dim=768):
+
+            if(option=='xavier'):
+                
+                #initialize the text_prompt_embeddings
+                nn.init.xavier_uniform_(self.text_prompt_deep_embeddings.data)
+                nn.init.xavier_uniform_(self.text_prompt_init_embeddings.data)
+
+                #initialize the image_prompt_embeddings
+                nn.init.xavier_uniform_(self.image_prompt_deep_embeddings.data)
+                nn.init.xavier_uniform_(self.image_prompt_init_embeddings.data)
+
+                #initialize the complete_prompt_embeddings
+                nn.init.xavier_uniform_(self.complete_prompt_deep_embeddings.data)
+                nn.init.xavier_uniform_(self.complete_prompt_init_embeddings.data)
+
+
+            elif(option=='kaiming'):
+                
+                #initialize the text_prompt_embeddings
+                nn.init.kaiming_uniform_(self.text_prompt_deep_embeddings.data)
+                nn.init.kaiming_uniform_(self.text_prompt_init_embeddings.data)
+
+                #initialize the image_prompt_embeddings
+                nn.init.kaiming_uniform_(self.image_prompt_deep_embeddings.data)
+                nn.init.kaiming_uniform_(self.image_prompt_init_embeddings.data)
+
+                #initialize the complete_prompt_embeddings
+                nn.init.kaiming_uniform_(self.complete_prompt_deep_embeddings.data)
+                nn.init.kaiming_uniform_(self.complete_prompt_init_embeddings.data)
+
+            elif (option=='normal'):
+
+                val = math.sqrt(6. / float(3 * reduce(mul, patch_size, 1) + prompt_dim))
+                #initialize the text_prompt_embeddings
+                nn.init.normal_(self.text_prompt_deep_embeddings.data,(-val,val))
+                nn.init.normal_(self.text_prompt_init_embeddings.data,(-val,val))
+
+                #initialize the image_prompt_embeddings
+                nn.init.normal_(self.image_prompt_deep_embeddings.data,(-val,val))
+                nn.init.normal_(self.image_prompt_init_embeddings.data,(-val,val))
+
+                #initialize the complete_prompt_embeddings
+                nn.init.normal_(self.complete_prompt_deep_embeddings.data,(-val,val))
+                nn.init.normal_(self.complete_prompt_init_embeddings.data,(-val,val))
+
+    
+    def handle_missing_image_modality(
+                                self,
+                                mmod_images,
+                                mmod_text_embeds,
+                                mmod_text_masks,
+                                image_token_type_idx
+                                ):
+
+            
+            #maximum height of the images from the missing modality batches
+            max_height= max([img.shape[1] for img in mmod_images])
+            #maximum width of the images from the missing modality batches
+            max_width= max([img.shape[2] for img in mmod_images])
+
+            #num width patches
+            num_width_patches=(max_width//self.hparams.config['patch_size'])
+            #num height patches
+            num_height_patches=(max_height//self.hparams.config['patch_size'])
+
+            #make zero tensors of (batch size, num_height_patches x num_width_patches, hidden_size)
+            image_mmod_mask_len=num_height_patches*num_width_patches
+            mmod_image_embeds=torch.zeros(mmod_images.shape[0],image_mmod_mask_len,self.hs).to(self.config['device'])
+
+            ####################################### creating the dummy tensort for the image masks ########################################
+            #make zero tensors of (batch size, num_height_patches x num_width_patches)
+            image_mmod_mask_fwd_pass=torch.zeros(mmod_image_embeds.shape[0],image_mmod_mask_len,dtype=torch.long).to(self.config['device'])
+            #include token type embeddings for the image tokens
+            mmod_text_embeds, mmod_image_embeds = (
+                        mmod_text_embeds + self.token_type_embeddings(torch.zeros_like(mmod_text_masks)),
+                        mmod_image_embeds+ self.token_type_embeddings(torch.full_like(image_mmod_mask_fwd_pass, image_token_type_idx))
+                    )
+
+            #text prompt mask with all ones 
+            text_prompt_mask_fwd_pass=torch.ones(mmod_text_embeds.shape[0],self.num_prompts).to(self.config['device'],dtype=torch.long)
+            cls_token_mask_fwd_pass=torch.ones(mmod_text_embeds.shape[0],1).to(self.config['device'],dtype=torch.long)
+
+            ##### prepend the inital prompt embeddings to the text and image embeddings #####
+            combined_img_mmod_embeds_init=torch.cat(
+                                (
+                                mmod_text_embeds[:,0,:],
+                                self.text_prompt_dropout(self.text_prompt_init_embeddings.expand(mmod_text_embeds.shape[0],-1,-1)),
+                                mmod_text_embeds[:,1:,:],
+                                mmod_image_embeds),
+                                dim=1)
+
+
+            total_mmod_mask_fwd_pass_image=torch.cat([
+                                            cls_token_mask_fwd_pass,
+                                            text_prompt_mask_fwd_pass,
+                                            mmod_text_masks[:,1:], #not considering the first token
+                                            image_mmod_mask_fwd_pass],dim=1)
+
+            #forward pass for text and bottleneck for the missing modality samples
+            for i in range(self.layers):
+
+                if(i==0):
+                    combined_img_mmod_embeds, _attn = self.transformer.blocks[i](combined_img_mmod_embeds_init, mask=total_mmod_mask_fwd_pass_image)
+                else:
+                    #add the prompts for specific layers
+                    if(i<=self.text_prompt_deep_embeddings.shape[0]):
+
+                        deep_text_prompt_embed= self.text_prompt_dropout(self.text_prompt_deep_embeddings[i-1].expand(mmod_text_embeds.shape[0],-1,-1))
+                        combined_img_mmod_embeds=torch.cat((
+                                                            combined_img_mmod_embeds[:,0,:], #first cls token of the combined embeddings                  
+                                                            deep_text_prompt_embed,
+                                                            combined_img_mmod_embeds[:,self.num_prompts+1:self.num_prompts+mmod_text_embeds.shape[1],:],
+                                                            combined_img_mmod_embeds[:,self.num_prompts+mmod_text_embeds.shape[1]:,:]
+                                                            ),dim=1)
+
+                        #forward pass for text and bottleneck for the missing modality samples
+                    combined_img_mmod_embeds, _attn = self.transformer.blocks[i](combined_img_mmod_embeds, mask=total_mmod_mask_fwd_pass_image)
+
+            #get the image embeddings from the combined embeddings
+            combined_img_mmod_embeds = self.transformer.norm(combined_img_mmod_embeds)
+
+            token_cls_embeddings=combined_img_mmod_embeds[:,0,:]
+
+
+            return(token_cls_embeddings)
+
+    def handle_missing_text_modality(self,mmod_images,
+                                mmod_text_embeds,
+                                mmod_text_masks,
+                                image_token_type_idx,
+                                mask_image
+                                ):
+
+            (mmod_image_embeds, mmod_image_masks,
+            patch_index,image_labels) = self.transformer.visual_embed(
+                    mmod_images,
+                    max_image_len=self.hparams.config["max_image_len"],
+                    mask_it=mask_image
+            )
+
+            #include token type embeddings for the text and image tokens
+            mmod_text_embeds, mmod_image_embeds = (
+                    mmod_text_embeds + self.token_type_embeddings(torch.zeros_like(mmod_text_masks)),
+                    mmod_image_embeds + self.token_type_embeddings(torch.full_like(mmod_image_masks, image_token_type_idx))
+            )
+
+            #mask declaration for the text, cls token and the image sections
+            text_mmod_mask_fwd_pass=torch.zeros(mmod_text_embeds.shape[0],self.hparams.config['max_len']-1).to(self.config['device'])
+            image_prompt_mask_fwd_pass=torch.ones(mmod_image_embeds.shape[0],self.num_prompts).to(self.config['device'])
+            cls_token_mask_fwd_pass=torch.ones(mmod_image_embeds.shape[0],1).to(self.config['device'],dtype=torch.long)
+
+            ##### prepend the inital prompt embeddings to the text and image embeddings #####
+            combined_text_mmod_embeds_init=torch.cat(
+                                (
+                                mmod_text_embeds[:,0,:],
+                                self.image_prompt_dropout(self.image_prompt_init_embeddings.expand(mmod_image_embeds.shape[0],-1,-1)),
+                                mmod_text_embeds[:,1:,:],
+                                mmod_image_embeds),
+                                dim=1)
+
+            total_mmod_mask_fwd_pass_text=torch.cat([cls_token_mask_fwd_pass,
+                                        image_prompt_mask_fwd_pass,
+                                        text_mmod_mask_fwd_pass,
+                                        mmod_image_masks],dim=1)
+
+            #forward pass for text and bottleneck for the missing modality samples
+            for i in range(self.layers):
+
+                if(i==0):
+                    combined_text_mmod_embeds, _attn = self.transformer.blocks[i](combined_text_mmod_embeds_init, mask=total_mmod_mask_fwd_pass_text)
+                else:
+                    #add the prompts for specific layers
+                    if(i<=self.text_prompt_deep_embeddings.shape[0]):
+
+                        deep_image_prompt_embed= self.image_prompt_dropout(self.image_prompt_deep_embeddings[i-1].expand(mmod_image_embeds.shape[0],-1,-1))
+                        combined_text_mmod_embeds=torch.cat((
+                                                            combined_text_mmod_embeds[:,0,:], #first cls token of the combined embeddings                  
+                                                            deep_image_prompt_embed,
+                                                            combined_text_mmod_embeds[:,self.num_prompts+1:self.num_prompts+mmod_text_embeds.shape[1],:],
+                                                            combined_text_mmod_embeds[:,self.num_prompts+mmod_text_embeds.shape[1]:,:]
+                                                            ),dim=1)
+
+                        #forward pass for text and bottleneck for the missing modality samples
+                    combined_text_mmod_embeds, _attn = self.transformer.blocks[i](combined_text_mmod_embeds, mask=total_mmod_mask_fwd_pass_text)
+
+
+            #get the image embeddings from the combined embeddings
+            combined_text_mmod_embeds = self.transformer.norm(combined_text_mmod_embeds)
+
+            token_cls_embeddings=combined_text_mmod_embeds[:,0,:]
+
+            return(token_cls_embeddings)
+
+    def infer(
+        self,
+        batch,
+        mask_image=False,
+        image_token_type_idx=1,
+        image_embeds=None,
+        image_masks=None):
+
+        #print(self.complete_prompt_embeddings )
+        #text embedding portion 
+        text_ids = batch["text_ids"]
+
+        #text masks and modality dropout flag
+        text_masks = batch[f"text_masks"]
+        mod_drop_flag=batch[f"mod_drop_flag"] #modality dropout flag
+
+        #read the text embeddings
+        text_embeds = self.text_embeddings(text_ids)
+
+        #read the images 
+        img = batch["image"]
+
+        if(self.mod_dropout_flag==False or (not any (mod_drop_flag)) ): #no modality dropout .... no need to use modality dropout mask
+            
+            #image embeddings, image masks
+            image_embeds,image_masks,patch_index,image_labels = self.transformer.visual_embed(img,
+                max_image_len=self.hparams.config["max_image_len"],
+                mask_it=mask_image,
+                )
+
+            #text embeddings + token type embeddings, image embeddings + token type embeddings
+            text_embeds, image_embeds = (
+                    text_embeds + self.token_type_embeddings(torch.zeros_like(text_masks)),
+                    image_embeds + self.token_type_embeddings(torch.full_like(image_masks, image_token_type_idx))
+            )
+
+            complete_embeds=torch.cat((text_embeds,
+                                image_embeds
+                                ),dim=1)
+            complete_masks=torch.cat((text_masks,image_masks),dim=1)
+
+            #normal vilt operation 
+            for i in range(self.layers):
+                complete_embeds, _attn = self.transformer.blocks[i](complete_embeds, mask=complete_masks)
+
+            complete_embeds = self.transformer.norm(complete_embeds)
+
+            token_cls_embeddings=complete_embeds[:,0,:]
+
+        else:
+            #missing modality scenario ####
+            index_modality_dropped=torch.where(mod_drop_flag==True)[0] #index of the samples where modality is dropped
+            index_complete_modality=torch.where(mod_drop_flag==False)[0] #index of the samples where modality is not dropped
+            id_modality_dropped=index_modality_dropped.tolist()
+            id_modality_complete=index_complete_modality.tolist()
+
+            #filtered segment containing the missing modality samples 
+            mmod_images=img[id_modality_dropped,:]  #image samples where modality is dropped
+            mmod_text_embeds=text_embeds[id_modality_dropped,:] 
+            mmod_text_masks=text_masks[id_modality_dropped,:]
+
+            #part of the filtered segment containing the complete modality samples
+            compl_images=img[id_modality_complete,:] #image samples where modality is not dropped (complete modality)
+            compl_text_embeds=text_embeds[id_modality_complete,:]
+            compl_text_masks=text_masks[id_modality_complete,:]
+
+
+            if(len(id_modality_complete)==0):
+
+                    if(self.mod_choice=="image"):
+
+                        pool_token = self.handle_missing_image_modality(mmod_images,
+                                                       mmod_text_embeds,
+                                                       mmod_text_masks,
+                                                       image_token_type_idx
+                                                       ) 
+
+                    elif(self.mod_choice=="text"):
+
+                            pool_token = self.handle_missing_text_modality(mmod_images,
+                                                       mmod_text_embeds,
+                                                       mmod_text_masks,
+                                                       image_token_type_idx,
+                                                       mask_image
+                                                       )  
+
+            else:
+
+                #attention between image, text and complete prompt embeddings
+                (
+                    compl_image_embeds,
+                    compl_image_masks,
+                        patch_index,
+                        image_labels,
+                ) = self.transformer.visual_embed(
+                        compl_images,
+                        max_image_len=self.hparams.config["max_image_len"],
+                        mask_it=mask_image
+                )
+
+                #include token type embeddings for the text and image tokens
+                compl_text_embeds, compl_image_embeds = (
+
+                    compl_text_embeds + self.token_type_embeddings(torch.zeros_like(compl_text_masks)),
+                    compl_image_embeds + self.token_type_embeddings(torch.full_like(compl_image_masks, image_token_type_idx))
+                )
+                
+                combined_embeds_compl=torch.cat(
+                                    compl_text_embeds,
+                                    compl_image_embeds
+                                    ),dim=1)
+                    
+                # complete embeddings + complete masks #
+                combined_embeds_compl_mask=torch.cat((compl_text_masks,compl_image_masks),dim=1)
+
+                #### first forward pass for the complete modality samples ####
+                #### first forward pass for the complete modality samples ####
+                for i in range(self.layers):
+
+                    combined_embeds_compl, _attn = self.transformer.blocks[i](combined_embeds_compl, mask=combined_embeds_compl_mask)
+
+                combined_embeds_compl = self.transformer.norm(combined_embeds_compl)
+
+                cls_feats_compl=combined_embeds_compl[:,0,:]
+
+                if(self.mod_choice=='image'):
+
+                    mmod_cls_img_feats= self.handle_missing_image_modality(mmod_images,
+                                                       mmod_text_embeds,
+                                                       mmod_text_masks,
+                                                       image_token_type_idx
+                                                       )
+
+                    pool_token=torch.zeros(text_feats.shape[0],self.hs).to(self.config['device'])
+
+                    pool_token[id_modality_complete,:]=cls_feats_compl
+                    pool_token[id_modality_dropped,:]=mmod_cls_img_feats
+
+                elif(self.mod_choice=='text'):
+
+                    mmod_cls_text_feats= self.handle_missing_text_modality(mmod_images,
+                                                       mmod_text_embeds,
+                                                       mmod_text_masks,
+                                                       image_token_type_idx,
+                                                       mask_image
+                                                       )
+
+                    pool_token=torch.zeros(text_feats.shape[0],self.hs).to(self.config['device'])
+
+                    pool_token[id_modality_complete,:]=cls_feats_compl
+                    pool_token[id_modality_dropped,:]=mmod_cls_text_feats
+
+                #pass it to classifier
+        cls_logits=self.classifier(pool_token)
+
+        return(cls_logits)
+
+    def forward(self, batch):
+
+        cls_logits=self.infer(batch)
+
+        return cls_logits
+
+
+
+            
+
+
+
+            
+
+
+
+            
+
+
+
+
+
+
+
+
+
+        
+                
+
+
+            
+
+
+
+
+
+
+
+    
+            
+
+
+
+
+
+
+
+
+            
+
+
+
+
+
+
+
+        
+
+
+
+
+
+
+
+
+
+
+
 
 
 
