@@ -2995,8 +2995,8 @@ class ViLT_multi_deep_prompt_missing_mod_token_head(pl.LightningModule):
                 nn.init.xavier_uniform_(self.image_prompt_init_embeddings.data)
 
                 #initialize the complete_prompt_embeddings
-                nn.init.xavier_uniform_(self.complete_prompt_deep_embeddings.data)
-                nn.init.xavier_uniform_(self.complete_prompt_init_embeddings.data)
+                # nn.init.xavier_uniform_(self.complete_prompt_deep_embeddings.data)
+                # nn.init.xavier_uniform_(self.complete_prompt_init_embeddings.data)
 
 
             elif(option=='kaiming'):
@@ -3010,8 +3010,8 @@ class ViLT_multi_deep_prompt_missing_mod_token_head(pl.LightningModule):
                 nn.init.kaiming_uniform_(self.image_prompt_init_embeddings.data)
 
                 #initialize the complete_prompt_embeddings
-                nn.init.kaiming_uniform_(self.complete_prompt_deep_embeddings.data)
-                nn.init.kaiming_uniform_(self.complete_prompt_init_embeddings.data)
+                # nn.init.kaiming_uniform_(self.complete_prompt_deep_embeddings.data)
+                # nn.init.kaiming_uniform_(self.complete_prompt_init_embeddings.data)
 
             elif (option=='normal'):
 
@@ -3025,8 +3025,8 @@ class ViLT_multi_deep_prompt_missing_mod_token_head(pl.LightningModule):
                 nn.init.normal_(self.image_prompt_init_embeddings.data,(-val,val))
 
                 #initialize the complete_prompt_embeddings
-                nn.init.normal_(self.complete_prompt_deep_embeddings.data,(-val,val))
-                nn.init.normal_(self.complete_prompt_init_embeddings.data,(-val,val))
+                # nn.init.normal_(self.complete_prompt_deep_embeddings.data,(-val,val))
+                # nn.init.normal_(self.complete_prompt_init_embeddings.data,(-val,val))
 
     
     def handle_missing_image_modality(
@@ -3066,9 +3066,16 @@ class ViLT_multi_deep_prompt_missing_mod_token_head(pl.LightningModule):
             cls_token_mask_fwd_pass=torch.ones(mmod_text_embeds.shape[0],1).to(self.config['device'],dtype=torch.long)
 
             ##### prepend the inital prompt embeddings to the text and image embeddings #####
+            #x_mmod=mmod_text_embeds[:,0,:].unsqueeze(mmod_text_embeds.shape[0],1,-1)
+            #print(x_mmod.shape)
+            # xmmod=mmod_text_embeds[:,0,:].unsqueeze(1)
+            # print(xmmod.shape)
+            # print(self.text_prompt_dropout(self.text_prompt_init_embeddings.expand(mmod_text_embeds.shape[0],-1,-1)).shape)
+            # print(mmod_text_embeds[:,1:,:].shape)
+            # print(mmod_image_embeds.shape)
             combined_img_mmod_embeds_init=torch.cat(
                                 (
-                                mmod_text_embeds[:,0,:],
+                                mmod_text_embeds[:,0,:].unsqueeze(1),
                                 self.text_prompt_dropout(self.text_prompt_init_embeddings.expand(mmod_text_embeds.shape[0],-1,-1)),
                                 mmod_text_embeds[:,1:,:],
                                 mmod_image_embeds),
@@ -3092,7 +3099,7 @@ class ViLT_multi_deep_prompt_missing_mod_token_head(pl.LightningModule):
 
                         deep_text_prompt_embed= self.text_prompt_dropout(self.text_prompt_deep_embeddings[i-1].expand(mmod_text_embeds.shape[0],-1,-1))
                         combined_img_mmod_embeds=torch.cat((
-                                                            combined_img_mmod_embeds[:,0,:], #first cls token of the combined embeddings                  
+                                                            combined_img_mmod_embeds[:,0,:].unsqueeze(1), #first cls token of the combined embeddings                  
                                                             deep_text_prompt_embed,
                                                             combined_img_mmod_embeds[:,self.num_prompts+1:self.num_prompts+mmod_text_embeds.shape[1],:],
                                                             combined_img_mmod_embeds[:,self.num_prompts+mmod_text_embeds.shape[1]:,:]
@@ -3137,7 +3144,7 @@ class ViLT_multi_deep_prompt_missing_mod_token_head(pl.LightningModule):
             ##### prepend the inital prompt embeddings to the text and image embeddings #####
             combined_text_mmod_embeds_init=torch.cat(
                                 (
-                                mmod_text_embeds[:,0,:],
+                                mmod_text_embeds[:,0,:].unsqueeze(1),
                                 self.image_prompt_dropout(self.image_prompt_init_embeddings.expand(mmod_image_embeds.shape[0],-1,-1)),
                                 mmod_text_embeds[:,1:,:],
                                 mmod_image_embeds),
@@ -3159,7 +3166,7 @@ class ViLT_multi_deep_prompt_missing_mod_token_head(pl.LightningModule):
 
                         deep_image_prompt_embed= self.image_prompt_dropout(self.image_prompt_deep_embeddings[i-1].expand(mmod_image_embeds.shape[0],-1,-1))
                         combined_text_mmod_embeds=torch.cat((
-                                                            combined_text_mmod_embeds[:,0,:], #first cls token of the combined embeddings                  
+                                                            combined_text_mmod_embeds[:,0,:].unsqueeze(1), #first cls token of the combined embeddings                  
                                                             deep_image_prompt_embed,
                                                             combined_text_mmod_embeds[:,self.num_prompts+1:self.num_prompts+mmod_text_embeds.shape[1],:],
                                                             combined_text_mmod_embeds[:,self.num_prompts+mmod_text_embeds.shape[1]:,:]
@@ -3255,13 +3262,12 @@ class ViLT_multi_deep_prompt_missing_mod_token_head(pl.LightningModule):
 
                     elif(self.mod_choice=="text"):
 
-                            pool_token = self.handle_missing_text_modality(mmod_images,
+                        pool_token = self.handle_missing_text_modality(mmod_images,
                                                        mmod_text_embeds,
                                                        mmod_text_masks,
                                                        image_token_type_idx,
                                                        mask_image
                                                        )  
-
             else:
 
                 #attention between image, text and complete prompt embeddings
@@ -3283,7 +3289,7 @@ class ViLT_multi_deep_prompt_missing_mod_token_head(pl.LightningModule):
                     compl_image_embeds + self.token_type_embeddings(torch.full_like(compl_image_masks, image_token_type_idx))
                 )
                 
-                combined_embeds_compl=torch.cat(
+                combined_embeds_compl=torch.cat((
                                     compl_text_embeds,
                                     compl_image_embeds
                                     ),dim=1)
@@ -3294,8 +3300,8 @@ class ViLT_multi_deep_prompt_missing_mod_token_head(pl.LightningModule):
                 #### first forward pass for the complete modality samples ####
                 #### first forward pass for the complete modality samples ####
                 for i in range(self.layers):
-
-                    combined_embeds_compl, _attn = self.transformer.blocks[i](combined_embeds_compl, mask=combined_embeds_compl_mask)
+                    combined_embeds_compl, _attn = self.transformer.blocks[i](combined_embeds_compl, 
+                                mask=combined_embeds_compl_mask)
 
                 combined_embeds_compl = self.transformer.norm(combined_embeds_compl)
 
@@ -3309,7 +3315,7 @@ class ViLT_multi_deep_prompt_missing_mod_token_head(pl.LightningModule):
                                                        image_token_type_idx
                                                        )
 
-                    pool_token=torch.zeros(text_feats.shape[0],self.hs).to(self.config['device'])
+                    pool_token=torch.zeros(text_embeds.shape[0],self.hs).to(self.config['device'])
 
                     pool_token[id_modality_complete,:]=cls_feats_compl
                     pool_token[id_modality_dropped,:]=mmod_cls_img_feats
@@ -3323,7 +3329,7 @@ class ViLT_multi_deep_prompt_missing_mod_token_head(pl.LightningModule):
                                                        mask_image
                                                        )
 
-                    pool_token=torch.zeros(text_feats.shape[0],self.hs).to(self.config['device'])
+                    pool_token=torch.zeros(text_embeds.shape[0],self.hs).to(self.config['device'])
 
                     pool_token[id_modality_complete,:]=cls_feats_compl
                     pool_token[id_modality_dropped,:]=mmod_cls_text_feats
